@@ -428,6 +428,9 @@ class MATTopComponentsAnalyzer(MATBaseAnalyzer):
     # ── Problem detection ─────────────────────────────────────────────────────
 
     def _analyze_problems(self) -> None:
+        from config import get_top_components_thresholds
+        thresholds = get_top_components_thresholds()
+
         problems: List[Dict] = []
         warnings: List[Dict] = []
 
@@ -436,11 +439,11 @@ class MATTopComponentsAnalyzer(MATBaseAnalyzer):
         # Classloader dominance
         for cl in self.report_data["classloaders"][:3]:
             mb = cl["retained_mb"]
-            if mb > 200:
+            if mb > thresholds.dominant_classloader_mb:
                 pct = (mb / total_mb * 100) if total_mb > 0 else 0
                 problems.append(
                     {
-                        "severity": "HIGH" if pct > 50 else "MEDIUM",
+                        "severity": "HIGH" if pct > thresholds.dominant_classloader_high_pct else "MEDIUM",
                         "type": "DOMINANT_CLASSLOADER",
                         "description": (
                             f"ClassLoader '{cl['name'][:60]}' retains "
@@ -457,7 +460,7 @@ class MATTopComponentsAnalyzer(MATBaseAnalyzer):
         for consumer in self.report_data["top_consumers"][:5]:
             mb = consumer["size_mb"]
             pct = (mb / total_mb * 100) if total_mb > 0 else 0
-            if mb > 500 or pct > 40:
+            if mb > thresholds.dominant_consumer_mb or pct > thresholds.dominant_consumer_pct:
                 problems.append(
                     {
                         "severity": "HIGH",
@@ -469,7 +472,7 @@ class MATTopComponentsAnalyzer(MATBaseAnalyzer):
                         "recommendation": "Examine its retention path in MAT Dominator Tree",
                     }
                 )
-            elif mb > 100:
+            elif mb > thresholds.large_consumer_mb:
                 warnings.append(
                     {
                         "type": "LARGE_CONSUMER",
@@ -480,7 +483,7 @@ class MATTopComponentsAnalyzer(MATBaseAnalyzer):
         # Waste analysis issues
         for waste_key, waste in self.report_data["waste_analysis"].items():
             wasted = waste["wasted_mb"]
-            if wasted > 50:
+            if wasted > thresholds.waste_problem_mb:
                 problems.append(
                     {
                         "severity": "MEDIUM",
@@ -495,7 +498,7 @@ class MATTopComponentsAnalyzer(MATBaseAnalyzer):
                         ),
                     }
                 )
-            elif wasted > 10:
+            elif wasted > thresholds.waste_warning_mb:
                 warnings.append(
                     {
                         "type": waste["type"],
@@ -593,11 +596,13 @@ class MATTopComponentsAnalyzer(MATBaseAnalyzer):
             if v["wasted_mb"] > 0
         }
         if non_zero_waste:
+            from config import get_top_components_thresholds
+            thresholds = get_top_components_thresholds()
             lines.append(_section("MEMORY WASTE ANALYSIS"))
             lines.append("")
             for waste_key, waste in non_zero_waste.items():
                 wasted = waste["wasted_mb"]
-                icon = "🔴" if wasted > 50 else ("🟡" if wasted > 10 else "🔵")
+                icon = "🔴" if wasted > thresholds.waste_problem_mb else ("🟡" if wasted > thresholds.waste_warning_mb else "🔵")
                 count_str = f"  ({waste['count']:,} instances)" if waste["count"] else ""
                 lines.append(
                     f"  {icon}  {waste['label']}: {wasted:.1f} MB wasted{count_str}"

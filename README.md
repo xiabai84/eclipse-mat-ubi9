@@ -58,7 +58,16 @@ curl http://localhost:8080/health
 ```
 
 ```json
-{ "status": "ok", "service": "mat-analysis", "version": "3.1.0", "mat_available": true }
+{
+  "status": "ok",
+  "service": "mat-analysis",
+  "version": "3.1.0",
+  "mat_available": true,
+  "disk": {
+    "reports": { "free_gb": 42.5, "total_gb": 100.0 },
+    "heapdumps": { "free_gb": 42.5, "total_gb": 100.0 }
+  }
+}
 ```
 
 Browse the interactive API docs at **http://localhost:8080/docs**.
@@ -194,6 +203,7 @@ Python packages installed via `pip` into `/opt/venv`:
 | `fastapi` | >= 0.111.0 | REST API framework |
 | `uvicorn[standard]` | >= 0.29.0 | ASGI server (with uvloop, httptools, watchfiles) |
 | `pydantic` | >= 2.0.0 | Request/response data validation |
+| `pydantic-settings` | >= 2.0.0 | Environment-variable-based configuration |
 | `beautifulsoup4` | >= 4.12.0 | HTML parsing for MAT report extraction |
 | `lxml` | >= 5.0.0 | Fast HTML parser backend for BeautifulSoup |
 | `python-multipart` | >= 0.0.9 | Required by FastAPI for file uploads |
@@ -431,10 +441,28 @@ ls ./heapdumps/*.hprof | parallel -j4 \
 
 ### Environment variables
 
+#### Core settings
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MAT_TIMEOUT` | `600` | Seconds before MAT subprocess is killed |
 | `UVICORN_WORKERS` | `4` | Number of uvicorn worker processes |
+| `MAX_UPLOAD_SIZE_BYTES` | `21474836480` | Upload file size limit in bytes (20 GB); returns HTTP 413 if exceeded |
+| `LOG_LEVEL` | `INFO` | Root log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+| `LOG_JSON` | `false` | Set to `true` for JSON-structured logging (one object per line, for ELK/CloudWatch) |
+
+#### Analyzer thresholds
+
+All analyzer thresholds are configurable via environment variables. Defaults match
+the original hardcoded values. Prefix determines the analyzer:
+
+| Prefix | Analyzer | Example variable |
+|--------|----------|------------------|
+| `SUSPECTS_` | Leak Suspects | `SUSPECTS_PRIMARY_LEAK_HIGH_MB=500` |
+| `OVERVIEW_` | System Overview | `OVERVIEW_LARGE_HEAP_HIGH_MB=2048` |
+| `TOP_COMPONENTS_` | Top Components | `TOP_COMPONENTS_DOMINANT_CONSUMER_MB=500` |
+
+See `backend/config.py` for the full list of threshold settings and their defaults.
 
 ```bash
 docker run -d \
@@ -555,16 +583,27 @@ eclipse-mat-service/
 ├── README.md
 │
 ├── backend/                            # Python REST service
-│   ├── app.py                          # FastAPI application (routes, MAT subprocess runner)
+│   ├── app.py                          # App factory (~57 lines) — creates FastAPI instance
+│   ├── config.py                       # Pydantic BaseSettings: all config + analyzer thresholds
+│   ├── logging_config.py               # Structured JSON logging (LOG_JSON=true)
+│   ├── models.py                       # Pydantic request/response models
+│   ├── exceptions.py                   # Centralized exception handlers
+│   ├── main.py                         # Local dev entry point (uvicorn.run)
 │   ├── requirements.txt                # Python dependencies (production)
 │   ├── requirements-test.txt           # Test dependencies (pytest, httpx)
+│   ├── routes/
+│   │   ├── operations.py               # /health (with disk info), /reports
+│   │   └── analysis.py                 # All /analyze/* routes
+│   ├── services/
+│   │   ├── mat_runner.py               # MAT subprocess execution
+│   │   └── analysis_service.py         # Analyzer orchestration + heapdump pipeline
 │   ├── analyzers/
 │   │   ├── __init__.py                 # Exports three analyzer classes
-│   │   ├── base.py                     # MATBaseAnalyzer: ZIP extraction, HTML parsing,
-│   │   │                               #   formatting, recommendation engine
+│   │   ├── base.py                     # MATBaseAnalyzer: ZIP extraction, HTML parsing
 │   │   ├── suspects.py                 # MATLeakSuspectsAnalyzer
 │   │   ├── overview.py                 # MATSystemOverviewAnalyzer
-│   │   └── top_components.py           # MATTopComponentsAnalyzer
+│   │   ├── top_components.py           # MATTopComponentsAnalyzer
+│   │   └── java_recommendations.json   # 16 diagnostic patterns (externalized)
 │   └── tests/
 │       ├── conftest.py                 # Shared fixtures (synthetic ZIPs, TestClient)
 │       ├── test_app.py                 # Route and helper tests

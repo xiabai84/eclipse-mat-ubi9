@@ -1,0 +1,210 @@
+{
+  "PRIMARY_LEAK": {
+    "title": "Memory Leak \u2014 Primary Suspect",
+    "root_cause": "A single object retains an unexpectedly large portion of the heap. Typically a long-lived container (static field, singleton, cache, or thread-local) holds strong references that were never released.",
+    "fix_steps": [
+      "Identify the GC root object in the Leak Suspects report.",
+      "Use MAT 'Path to GC Roots' to trace the reference chain.",
+      "Add explicit cleanup \u2014 clear(), remove(), close() \u2014 at the lifecycle boundary.",
+      "Use WeakReference / SoftReference for optional cached data.",
+      "Replace HashMap with Caffeine / Guava Cache (bounded, evicting)."
+    ],
+    "code_example": "// BAD: static map grows forever\nprivate static final Map<String, Session> SESSIONS = new HashMap<>();\n\n// GOOD: Caffeine cache with eviction\nprivate static final Cache<String, Session> SESSIONS =\n    Caffeine.newBuilder()\n        .maximumSize(10_000)\n        .expireAfterAccess(30, TimeUnit.MINUTES)\n        .build();",
+    "references": [
+      "https://docs.oracle.com/javase/8/docs/technotes/guides/troubleshoot/memleaks002.html",
+      "https://github.com/ben-manes/caffeine"
+    ]
+  },
+  "SIGNIFICANT_LEAK_RATIO": {
+    "title": "Heap Dominated by Leak Suspects (>50%)",
+    "root_cause": "Leak suspects account for more than half the heap \u2014 a systemic leak rather than an isolated incident.",
+    "fix_steps": [
+      "Take heap dumps at intervals; compare with MAT 'Compare Snapshots'.",
+      "Find classes whose instance count grows monotonically over time.",
+      "Profile allocation hot-spots with async-profiler or JFR.",
+      "Audit all AutoCloseable resources for try-with-resources usage."
+    ],
+    "code_example": "// GOOD: always use try-with-resources\ntry (Connection conn = dataSource.getConnection();\n     PreparedStatement ps = conn.prepareStatement(sql)) {\n    // work\n}  // both closed automatically on exit or exception",
+    "references": [
+      "https://docs.oracle.com/javase/tutorial/essential/exceptions/tryResourceClose.html"
+    ]
+  },
+  "LARGE_HEAP": {
+    "title": "Unexpectedly Large Heap Usage (>1 GB)",
+    "root_cause": "The JVM heap is very large. May be normal for the workload, or may indicate objects are not released as expected.",
+    "fix_steps": [
+      "Review GC logs: -Xlog:gc* and inspect pause times.",
+      "Verify -Xmx is appropriate \u2014 do not set it higher than necessary.",
+      "Use G1GC (default in JDK 9+) or ZGC for large heaps.",
+      "Enable string deduplication: -XX:+UseStringDeduplication.",
+      "Review cache sizes and enforce explicit upper bounds."
+    ],
+    "code_example": "# Recommended JVM flags for large-heap services\njava -Xms2g -Xmx8g \\\n     -XX:+UseG1GC -XX:MaxGCPauseMillis=200 \\\n     -XX:+UseStringDeduplication \\\n     -Xlog:gc*:file=gc.log:time,uptime:filecount=5,filesize=20m \\\n     -jar myapp.jar",
+    "references": [
+      "https://docs.oracle.com/en/java/javase/17/gctuning/"
+    ]
+  },
+  "HIGH_OBJECT_COUNT": {
+    "title": "Excessive Object Count (>1 million objects)",
+    "root_cause": "Over 1 million heap objects. Typical causes: unbounded caches, boxing of primitive types (Integer, Long, String), DTO explosion, or loading entire DB result sets into memory.",
+    "fix_steps": [
+      "Use primitive-specialised collections (Eclipse Collections, Koloboke).",
+      "Apply Flyweight pattern to share immutable state.",
+      "Page or stream large DB result sets \u2014 never load all rows at once.",
+      "Reduce DTO mapping: avoid creating a new object per mapping call."
+    ],
+    "code_example": "// BAD: autoboxing creates Integer objects\nMap<Integer, Integer> map = new HashMap<>();\n\n// GOOD: primitive map (Eclipse Collections)\nMutableIntIntMap map = IntIntMaps.mutable.empty();",
+    "references": [
+      "https://eclipse.dev/collections/"
+    ]
+  },
+  "HIGH_CLASSLOADER_COUNT": {
+    "title": "ClassLoader Leak (>20 ClassLoaders)",
+    "root_cause": "High ClassLoader count indicates a classloader leak \u2014 typically caused by hot-redeploys where old ClassLoaders are not released because a static field or thread-local still references them.",
+    "fix_steps": [
+      "After each redeploy, capture a heap dump and check ClassLoader references.",
+      "Audit static fields \u2014 they keep their ClassLoader alive for the JVM lifetime.",
+      "Stop threads and clear thread-locals before undeploy.",
+      "Implement ServletContextListener.contextDestroyed() to clean up."
+    ],
+    "code_example": "@WebListener\npublic class AppCleanup implements ServletContextListener {\n    @Override\n    public void contextDestroyed(ServletContextEvent e) {\n        Introspector.flushCaches();           // clear reflection caches\n        LogManager.shutdown();               // flush log buffers\n        AbandonedConnectionCleanupThread.checkedShutdown(); // MySQL driver\n    }\n}",
+    "references": [
+      "https://wiki.eclipse.org/MemoryAnalyzer/Classloader_Leaks"
+    ]
+  },
+  "HIGH_GC_ROOT_COUNT": {
+    "title": "High GC Root Count (>5000 roots)",
+    "root_cause": "GC roots (static fields, thread stacks, JNI globals) are the reference graph's starting points. A large count means more GC work and longer pause times.",
+    "fix_steps": [
+      "Audit static fields that hold large collections.",
+      "Prefer instance fields over static fields.",
+      "Reduce long-lived threads; use thread pools with bounded queues.",
+      "Audit JNI usage \u2014 global JNI references cannot be auto-released by the JVM."
+    ],
+    "code_example": "// BAD: static registry anchors all objects as GC roots\npublic class Registry {\n    private static final List<Handler> HANDLERS = new ArrayList<>();\n}\n\n// GOOD: weak list \u2014 handlers GC'd when no longer referenced elsewhere\nprivate static final List<WeakReference<Handler>> HANDLERS =\n    new CopyOnWriteArrayList<>();",
+    "references": []
+  },
+  "THREAD_LEAK": {
+    "title": "Thread / ThreadLocal Memory Leak",
+    "root_cause": "Thread-pool threads accumulate data in ThreadLocal variables. Because pooled threads are never destroyed, the ThreadLocal value lives for the entire JVM lifetime.",
+    "fix_steps": [
+      "Always call ThreadLocal.remove() in a finally block after each task.",
+      "Pass context via method parameters or request-scoped beans instead.",
+      "In Spring Boot: verify RequestContextHolder is reset between requests.",
+      "Monitor retained heap per thread in MAT Thread Overview."
+    ],
+    "code_example": "// BAD: ThreadLocal not removed \u2014 leaks in thread pools\nexecutor.submit(() -> {\n    CTX.set(new Context(request));\n    process();   // CTX.remove() missing!\n});\n\n// GOOD: always use try/finally\nexecutor.submit(() -> {\n    CTX.set(new Context(request));\n    try { process(); }\n    finally { CTX.remove(); }   // critical\n});",
+    "references": [
+      "https://errorprone.info/bugpattern/ThreadLocalUsage"
+    ]
+  },
+  "LARGE_ARRAYS": {
+    "title": "Large Array Allocation",
+    "root_cause": "Large arrays (byte[], char[], int[]) retain significant heap. Common causes: reading entire files into memory, unbound byte buffers, or oversized pre-allocated arrays.",
+    "fix_steps": [
+      "Stream large files: Files.lines(), InputStream chunking.",
+      "Use ByteBuffer.allocateDirect() for I/O-intensive paths (off-heap).",
+      "Pool and reuse byte arrays (Netty PooledByteBufAllocator).",
+      "Set maximum read sizes and reject oversized inputs early."
+    ],
+    "code_example": "// BAD: entire file in memory\nbyte[] data = Files.readAllBytes(largePath);\n\n// GOOD: chunked streaming\ntry (InputStream in = Files.newInputStream(largePath)) {\n    byte[] buf = new byte[8192];\n    int n;\n    while ((n = in.read(buf)) != -1) process(buf, 0, n);\n}",
+    "references": []
+  },
+  "LARGE_STRING_USAGE": {
+    "title": "Excessive String Memory Usage",
+    "root_cause": "Large heap area occupied by String / char[] objects. Common causes: duplicate strings, log buffers, SQL query strings, or JSON payloads materialised as strings instead of streamed.",
+    "fix_steps": [
+      "Enable JVM string deduplication: -XX:+UseStringDeduplication (G1GC only).",
+      "Use StringBuilder for string concatenation in loops.",
+      "Stream JSON/XML instead of building large String payloads.",
+      "Use byte arrays for binary data instead of Base64-encoded strings."
+    ],
+    "code_example": "// BAD: O(n\u00b2) string allocations\nString result = \"\";\nfor (String s : list) result += s + \",\";\n\n// GOOD: StringBuilder \u2014 O(n) with single allocation\nStringBuilder sb = new StringBuilder();\nfor (String s : list) sb.append(s).append(',');",
+    "references": [
+      "https://openjdk.org/jeps/192"
+    ]
+  },
+  "LARGE_CACHE": {
+    "title": "Unbounded Cache / Collection",
+    "root_cause": "A cache or collection grows without a size limit or eviction policy, consuming an ever-increasing fraction of the heap.",
+    "fix_steps": [
+      "Add a maximum size and eviction policy (LRU, LFU, TTL).",
+      "Replace HashMap with Caffeine or Guava Cache.",
+      "Use WeakHashMap so entries are evicted when key has no other referent.",
+      "Expose cache size and hit/miss rate as metrics (Micrometer)."
+    ],
+    "code_example": "// BAD\nprivate static final Map<String, Object> CACHE = new HashMap<>();\n\n// GOOD (Caffeine)\nprivate static final Cache<String, Object> CACHE =\n    Caffeine.newBuilder()\n        .maximumSize(10_000)\n        .expireAfterWrite(10, TimeUnit.MINUTES)\n        .recordStats()\n        .build();",
+    "references": [
+      "https://github.com/ben-manes/caffeine"
+    ]
+  },
+  "SYSTEM_CLASSLOADER_DOMINANCE": {
+    "title": "System ClassLoader Dominates Heap",
+    "root_cause": "The system (bootstrap) ClassLoader retains a very large share of the heap. Usually means static data in JDK or third-party library classes is accumulating \u2014 string intern pools, logging buffers, static singleton caches.",
+    "fix_steps": [
+      "In MAT, inspect the system ClassLoader's retained set.",
+      "Look for static fields in library classes holding growing collections.",
+      "Check logging configuration \u2014 oversized async appender queues.",
+      "Call Introspector.flushCaches() on application shutdown."
+    ],
+    "code_example": "Runtime.getRuntime().addShutdownHook(new Thread(() -> {\n    Introspector.flushCaches();\n    LogManager.shutdown();   // Log4j 2\n}));",
+    "references": []
+  },
+  "DUPLICATE_STRINGS": {
+    "title": "Duplicate String Objects",
+    "root_cause": "Thousands of String objects with identical content exist on the heap. Common sources: JSON field names, enum-like string constants, database column names, or keys created via new String(literal).",
+    "fix_steps": [
+      "Enable JVM string deduplication: -XX:+UseStringDeduplication.",
+      "Use enums or interned constants instead of raw String literals.",
+      "Use String.intern() for high-frequency, low-cardinality strings.",
+      "Avoid new String(\"literal\") \u2014 it bypasses the string pool."
+    ],
+    "code_example": "// BAD: 100k identical String objects\nfor (int i = 0; i < 100_000; i++)\n    list.add(new String(\"com.example.UserService\"));\n\n// GOOD: share the same reference\nprivate static final String SERVICE = \"com.example.UserService\";\nfor (int i = 0; i < 100_000; i++)\n    list.add(SERVICE);",
+    "references": []
+  },
+  "EMPTY_COLLECTIONS": {
+    "title": "Excessive Empty Collections",
+    "root_cause": "Many empty ArrayList / HashMap / HashSet instances occupy heap unnecessarily. Even an empty ArrayList allocates a backing Object[] array.",
+    "fix_steps": [
+      "Return Collections.emptyList() / emptyMap() / emptySet() \u2014 shared singletons.",
+      "Use List.of() / Map.of() / Set.of() (Java 9+) for small immutable collections.",
+      "Initialise collections lazily \u2014 only when the first element is added."
+    ],
+    "code_example": "// BAD: always allocates new ArrayList even for empty result\npublic List<User> findByRole(String role) {\n    List<User> result = new ArrayList<>();\n    if (role == null) return result;\n    ...\n}\n\n// GOOD: shared empty singleton\npublic List<User> findByRole(String role) {\n    if (role == null) return Collections.emptyList();\n    return queryUsers(role);\n}",
+    "references": []
+  },
+  "PRIMITIVE_ARRAYS_CONSTANT": {
+    "title": "Redundant Constant Primitive Arrays",
+    "root_cause": "Many primitive arrays (byte[], int[], char[]) contain identical constant data. Each copy wastes heap without adding information.",
+    "fix_steps": [
+      "Define the array once as a private static final field.",
+      "Copy it when mutation is needed: Arrays.copyOf(CONSTANT, len).",
+      "For byte buffers: use a shared ByteBuffer or a pool."
+    ],
+    "code_example": "// BAD: new byte[16] on every call\npublic byte[] defaultHeader() { return new byte[16]; }\n\n// GOOD: shared constant, defensive copy when needed\nprivate static final byte[] EMPTY_HEADER = new byte[16];\npublic byte[] defaultHeader() {\n    return Arrays.copyOf(EMPTY_HEADER, EMPTY_HEADER.length);\n}",
+    "references": []
+  },
+  "HIGH_RETAINED_RATIO": {
+    "title": "Object with High Retained-to-Shallow Heap Ratio",
+    "root_cause": "A small (low shallow heap) object retains a disproportionately large object tree (high retained heap). Releasing this 'anchor' object would free large memory.",
+    "fix_steps": [
+      "Use MAT 'Path to GC Roots' on the anchor object.",
+      "Add explicit null-out or close() at the lifecycle boundary.",
+      "Apply the AutoCloseable / Dispose pattern for resource-holding objects."
+    ],
+    "code_example": "// BAD: tiny anchor retains 2 GB object graph\nclass SessionManager {          // shallow: 32 bytes\n    Map<String, Session> cache  // retained: 2 GB\n        = new HashMap<>();      // ...held by a static field, never cleared\n}\n\n// GOOD: bounded cache with automatic eviction\nprivate final Cache<String, Session> cache =\n    Caffeine.newBuilder()\n        .maximumSize(5000)\n        .expireAfterAccess(30, TimeUnit.MINUTES)\n        .build();",
+    "references": []
+  },
+  "ARRAY_FILL_RATIO": {
+    "title": "Arrays with Low Fill Ratio",
+    "root_cause": "Large arrays (typically ArrayList backing arrays or HashMap internal tables) are significantly under-filled, wasting heap space.",
+    "fix_steps": [
+      "Use ArrayList.trimToSize() after bulk population.",
+      "Construct ArrayList with the correct initial capacity.",
+      "For maps: use the right load factor and initial capacity.",
+      "Switch to dynamic collections instead of pre-allocating large fixed arrays."
+    ],
+    "code_example": "// BAD: over-allocated backing array\nList<String> list = new ArrayList<>(1_000_000);\nlist.add(\"only one element\");\n\n// GOOD: right-size after population\nList<String> list = new ArrayList<>();\npopulateList(list);\n((ArrayList<String>) list).trimToSize();  // or: List.copyOf(list)",
+    "references": []
+  }
+}

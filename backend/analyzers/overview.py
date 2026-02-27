@@ -130,6 +130,9 @@ class MATSystemOverviewAnalyzer(MATBaseAnalyzer):
           8  State
           9  State value
         """
+        from config import get_overview_thresholds
+        thresholds = get_overview_thresholds()
+
         soup = self.html_files[filename]["soup"]
 
         table = soup.find("table", class_="result") or soup.find("table")
@@ -173,7 +176,7 @@ class MATSystemOverviewAnalyzer(MATBaseAnalyzer):
             }
             threads.append(thread_info)
 
-            if retained_mb > 50:
+            if retained_mb > thresholds.thread_leak_mb:
                 self.report_data["thread_analysis"]["potential_leaks"].append(
                     {
                         "thread": name[:100],
@@ -299,13 +302,16 @@ class MATSystemOverviewAnalyzer(MATBaseAnalyzer):
     # ── Problem detection ─────────────────────────────────────────────────────
 
     def _analyze_problems(self) -> None:
+        from config import get_overview_thresholds
+        thresholds = get_overview_thresholds()
+
         problems: List[Dict] = []
         warnings: List[Dict] = []
         s = self.report_data["summary"]
 
         # Heap size
         heap_mb = s["used_heap_mb"]
-        if heap_mb > 2048:
+        if heap_mb > thresholds.large_heap_high_mb:
             problems.append(
                 {
                     "severity": "HIGH",
@@ -314,7 +320,7 @@ class MATSystemOverviewAnalyzer(MATBaseAnalyzer):
                     "recommendation": "Investigate retained objects; reduce heap or tune JVM flags",
                 }
             )
-        elif heap_mb > 1024:
+        elif heap_mb > thresholds.large_heap_medium_mb:
             problems.append(
                 {
                     "severity": "MEDIUM",
@@ -326,7 +332,7 @@ class MATSystemOverviewAnalyzer(MATBaseAnalyzer):
 
         # Object count
         obj = s["total_objects"]
-        if obj > 1_000_000:
+        if obj > thresholds.high_object_count:
             problems.append(
                 {
                     "severity": "HIGH",
@@ -335,7 +341,7 @@ class MATSystemOverviewAnalyzer(MATBaseAnalyzer):
                     "recommendation": "Investigate object creation patterns; consider pooling",
                 }
             )
-        elif obj > 500_000:
+        elif obj > thresholds.elevated_object_count:
             warnings.append(
                 {
                     "type": "ELEVATED_OBJECT_COUNT",
@@ -345,7 +351,7 @@ class MATSystemOverviewAnalyzer(MATBaseAnalyzer):
 
         # Class loaders
         cl = s["total_classloaders"]
-        if cl > 20:
+        if cl > thresholds.high_classloader_count:
             problems.append(
                 {
                     "severity": "HIGH",
@@ -356,7 +362,7 @@ class MATSystemOverviewAnalyzer(MATBaseAnalyzer):
                     ),
                 }
             )
-        elif cl > 10:
+        elif cl > thresholds.elevated_classloader_count:
             warnings.append(
                 {
                     "type": "ELEVATED_CLASSLOADER_COUNT",
@@ -366,7 +372,7 @@ class MATSystemOverviewAnalyzer(MATBaseAnalyzer):
 
         # GC roots
         gc = s["total_gc_roots"]
-        if gc > 5000:
+        if gc > thresholds.high_gc_root_count:
             problems.append(
                 {
                     "severity": "MEDIUM",
@@ -381,7 +387,7 @@ class MATSystemOverviewAnalyzer(MATBaseAnalyzer):
             mb = leak["retained_mb"]
             problems.append(
                 {
-                    "severity": "HIGH" if mb > 100 else "MEDIUM",
+                    "severity": "HIGH" if mb > thresholds.thread_leak_severe_mb else "MEDIUM",
                     "type": "THREAD_LEAK",
                     "description": leak["concern"],
                     "recommendation": (
@@ -392,7 +398,7 @@ class MATSystemOverviewAnalyzer(MATBaseAnalyzer):
 
         # Large arrays
         for cls in self.report_data["class_histogram"]:
-            if "[]" in cls["class"] and cls["retained_mb"] > 100:
+            if "[]" in cls["class"] and cls["retained_mb"] > thresholds.large_array_mb:
                 problems.append(
                     {
                         "severity": "MEDIUM",
@@ -408,7 +414,7 @@ class MATSystemOverviewAnalyzer(MATBaseAnalyzer):
 
         # Large String usage
         for cls in self.report_data["class_histogram"]:
-            if "String" in cls["class"] and cls["retained_mb"] > 100:
+            if "String" in cls["class"] and cls["retained_mb"] > thresholds.large_string_mb:
                 warnings.append(
                     {
                         "type": "LARGE_STRING_USAGE",
@@ -423,7 +429,7 @@ class MATSystemOverviewAnalyzer(MATBaseAnalyzer):
         cache_terms = {"cache", "map", "table", "buffer", "pool"}
         for consumer in self.report_data["top_consumers"]:
             if any(t in consumer["name"].lower() for t in cache_terms):
-                if consumer["size_mb"] > 100:
+                if consumer["size_mb"] > thresholds.large_cache_mb:
                     problems.append(
                         {
                             "severity": "MEDIUM",

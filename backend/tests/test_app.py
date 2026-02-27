@@ -1,4 +1,4 @@
-"""Unit tests for app.py — helpers and routes."""
+"""Unit tests for app routes and service helpers."""
 
 import json
 import shutil
@@ -9,7 +9,10 @@ import pytest
 from starlette.testclient import TestClient
 
 # Import after sys.path is set up by conftest
-from app import app, _find_report, _resolve_output, _run_analyzer
+from app import app
+from services.mat_runner import find_report
+from services.analysis_service import resolve_output, run_analyzer
+from models import AnalyzeRequest
 from analyzers import MATLeakSuspectsAnalyzer
 
 
@@ -25,25 +28,25 @@ def client():
 class TestFindReport:
     def test_find_report_matches(self, tmp_path: Path):
         (tmp_path / "app_Leak_Suspects.zip").touch()
-        result = _find_report(tmp_path, ["Leak_Suspects", "Suspects"])
+        result = find_report(tmp_path, ["Leak_Suspects", "Suspects"])
         assert result is not None
         assert "Leak_Suspects" in result.name
 
     def test_find_report_no_match(self, tmp_path: Path):
         (tmp_path / "unrelated.zip").touch()
-        result = _find_report(tmp_path, ["Leak_Suspects", "Suspects"])
+        result = find_report(tmp_path, ["Leak_Suspects", "Suspects"])
         assert result is None
 
 
 class TestResolveOutput:
     def test_resolve_output_with_dir(self, tmp_path: Path):
         out = tmp_path / "custom_out"
-        result = _resolve_output(str(out), "test")
+        result = resolve_output(str(out), "test")
         assert result == str(out)
         assert out.exists()
 
     def test_resolve_output_none(self):
-        result = _resolve_output(None, "test")
+        result = resolve_output(None, "test")
         assert "mat_test_" in result
         # Clean up temp dir
         shutil.rmtree(result, ignore_errors=True)
@@ -51,11 +54,10 @@ class TestResolveOutput:
 
 class TestRunAnalyzer:
     def test_run_analyzer_file_not_found(self):
-        from app import AnalyzeRequest
         from fastapi import HTTPException
         req = AnalyzeRequest(report_path="/nonexistent/path.zip")
         with pytest.raises(HTTPException) as exc_info:
-            _run_analyzer(MATLeakSuspectsAnalyzer, req)
+            run_analyzer(MATLeakSuspectsAnalyzer, req)
         assert exc_info.value.status_code == 404
 
 

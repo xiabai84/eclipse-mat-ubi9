@@ -462,10 +462,13 @@ class MATLeakSuspectsAnalyzer(MATBaseAnalyzer):
         self.report_data["primary_suspect"] = all_suspects[0]
         primary_mb = all_suspects[0].get("retained_mb", 0)
 
+        from config import get_suspects_thresholds
+        thresholds = get_suspects_thresholds()
+
         significant, others = [], []
         for s in all_suspects[1:]:
             mb = s.get("retained_mb", 0)
-            if mb > 50 or (primary_mb > 0 and mb / primary_mb > 0.2):
+            if mb > thresholds.significant_suspect_mb or (primary_mb > 0 and mb / primary_mb > thresholds.significant_suspect_ratio):
                 significant.append(s)
             else:
                 others.append(s)
@@ -474,13 +477,16 @@ class MATLeakSuspectsAnalyzer(MATBaseAnalyzer):
         self.report_data["other_suspects"] = others
 
     def _identify_problems(self) -> None:
+        from config import get_suspects_thresholds
+        thresholds = get_suspects_thresholds()
+
         problems: List[Dict] = []
         warnings: List[Dict] = []
 
         primary = self.report_data["primary_suspect"]
         if primary:
             mb = primary.get("retained_mb", 0)
-            sev = "HIGH" if mb > 500 else "MEDIUM"
+            sev = "HIGH" if mb > thresholds.primary_leak_high_mb else "MEDIUM"
             cls = primary.get("class_name") or "Unknown class"
             size_str = _size_label(primary)
             problems.append(
@@ -497,7 +503,7 @@ class MATLeakSuspectsAnalyzer(MATBaseAnalyzer):
             )
 
         pct = self.report_data["summary"]["heap_leak_pct"]
-        if pct > 70:
+        if pct > thresholds.heap_leak_critical_pct:
             problems.append(
                 {
                     "severity": "HIGH",
@@ -508,7 +514,7 @@ class MATLeakSuspectsAnalyzer(MATBaseAnalyzer):
                     ),
                 }
             )
-        elif pct > 40:
+        elif pct > thresholds.heap_leak_warning_pct:
             warnings.append(
                 {
                     "type": "ELEVATED_LEAK_RATIO",
@@ -528,7 +534,7 @@ class MATLeakSuspectsAnalyzer(MATBaseAnalyzer):
             cls = s.get("class_name") or f"Suspect {s['id']}"
             size_str = _size_label(s)
             # Severity: HIGH if large, MEDIUM if significant, LOW if minor
-            if mb > 200:
+            if mb > thresholds.secondary_leak_high_mb:
                 sev = "HIGH"
             elif s in self.report_data["significant_suspects"]:
                 sev = "MEDIUM"

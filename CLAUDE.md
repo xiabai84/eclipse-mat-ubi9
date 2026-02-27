@@ -104,14 +104,26 @@ curl -s -X POST http://localhost:8080/analyze/heapdump/report -F "file=@./heapdu
 
 ```
 backend/
-├── app.py                    # FastAPI application (all routes, MAT subprocess runner)
-├── requirements.txt          # Python dependencies
+├── app.py                          # App factory (~57 lines) — creates FastAPI instance
+├── config.py                       # Pydantic BaseSettings: all config + analyzer thresholds
+├── logging_config.py               # Structured JSON logging (LOG_JSON=true for ELK/CloudWatch)
+├── models.py                       # Pydantic request/response models
+├── exceptions.py                   # Centralized exception handlers
+├── main.py                         # Local dev entry point (uvicorn.run)
+├── requirements.txt                # Python dependencies
+├── routes/
+│   ├── operations.py               # /health, /reports
+│   └── analysis.py                 # All /analyze/* routes
+├── services/
+│   ├── mat_runner.py               # MAT subprocess execution (find_report, run_mat)
+│   └── analysis_service.py         # Analyzer orchestration + heapdump pipeline
 └── analyzers/
-    ├── __init__.py           # Exports three analyzer classes
-    ├── base.py               # MATBaseAnalyzer (abstract): ZIP extraction, HTML parsing, Java recommendations engine
-    ├── suspects.py           # MATLeakSuspectsAnalyzer: leak suspect objects, heap %, retained sizes
-    ├── overview.py           # MATSystemOverviewAnalyzer: heap summary, top entries by type
-    └── top_components.py     # MATTopComponentsAnalyzer: largest retained-heap components
+    ├── __init__.py                 # Exports three analyzer classes
+    ├── base.py                     # MATBaseAnalyzer (abstract): ZIP extraction, HTML parsing
+    ├── suspects.py                 # MATLeakSuspectsAnalyzer: leak suspect objects, heap %, retained sizes
+    ├── overview.py                 # MATSystemOverviewAnalyzer: heap summary, top entries by type
+    ├── top_components.py           # MATTopComponentsAnalyzer: largest retained-heap components
+    └── java_recommendations.json   # 16 diagnostic patterns (externalized from base.py)
 
 docker/
 ├── Dockerfile                # 3-stage build: rpm-builder → pip-builder → runtime
@@ -130,10 +142,23 @@ Upload .hprof → Save to /heapdumps → Run MAT (subprocess) → Generate ZIPs 
   → Parse ZIPs with BeautifulSoup → Extract tables/data → Build report → Return JSON or text
 ```
 
+### Import Dependency Graph (no circular imports)
+```
+config.py → (no local imports)
+models.py → config
+logging_config.py → config
+exceptions.py → (no local imports)
+services/ → config, analyzers, models
+routes/ → config, models, analyzers, services
+app.py → config, exceptions, logging_config, routes
+```
+
 ### Analyzer Inheritance Pattern
-- `MATBaseAnalyzer` (abstract): ZIP extraction, HTML parsing, formatting utilities, Java recommendations DB
+- `MATBaseAnalyzer` (abstract): ZIP extraction, HTML parsing, formatting utilities
+- Java recommendations loaded from `analyzers/java_recommendations.json`
 - Subclasses implement `parse_report()` and `generate_report()`
-- `build_summary()` matches detected problems against 10+ diagnostic patterns (PRIMARY_LEAK, LARGE_HEAP, THREAD_LEAK, etc.)
+- `build_summary()` matches detected problems against 16 diagnostic patterns
+- Analyzer thresholds are configurable via env vars (see Configuration below)
 
 ## API Endpoints
 
@@ -150,9 +175,24 @@ Upload .hprof → Save to /heapdumps → Run MAT (subprocess) → Generate ZIPs 
 
 ## Environment & Configuration
 
+### Core Settings (config.py `Settings`)
+
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `MAT_TIMEOUT` | `600` | Seconds before MAT subprocess is killed |
+| `REPORTS_DIR` | `/reports` | Default reports directory |
+| `HEAPDUMPS_DIR` | `/heapdumps` | Default heapdumps directory |
+| `MAX_UPLOAD_SIZE_BYTES` | `21474836480` (20 GB) | Upload file size limit (413 if exceeded) |
+| `LOG_LEVEL` | `INFO` | Root log level |
+| `LOG_JSON` | `false` | `true` → JSON-structured logging for ELK/CloudWatch |
+
+### Analyzer Thresholds (env var prefixed)
+
+Suspects (`SUSPECTS_` prefix): `PRIMARY_LEAK_HIGH_MB=500`, `SIGNIFICANT_SUSPECT_MB=50`, `SIGNIFICANT_SUSPECT_RATIO=0.2`, `SECONDARY_LEAK_HIGH_MB=200`, `HEAP_LEAK_CRITICAL_PCT=70`, `HEAP_LEAK_WARNING_PCT=40`
+
+Overview (`OVERVIEW_` prefix): `LARGE_HEAP_HIGH_MB=2048`, `LARGE_HEAP_MEDIUM_MB=1024`, `HIGH_OBJECT_COUNT=1000000`, `ELEVATED_OBJECT_COUNT=500000`, `HIGH_CLASSLOADER_COUNT=20`, `ELEVATED_CLASSLOADER_COUNT=10`, `HIGH_GC_ROOT_COUNT=5000`, `THREAD_LEAK_MB=50`, `THREAD_LEAK_SEVERE_MB=100`, `LARGE_ARRAY_MB=100`, `LARGE_STRING_MB=100`, `LARGE_CACHE_MB=100`
+
+Top Components (`TOP_COMPONENTS_` prefix): `DOMINANT_CLASSLOADER_MB=200`, `DOMINANT_CLASSLOADER_HIGH_PCT=50`, `DOMINANT_CONSUMER_MB=500`, `DOMINANT_CONSUMER_PCT=40`, `LARGE_CONSUMER_MB=100`, `WASTE_PROBLEM_MB=50`, `WASTE_WARNING_MB=10`
 
 ### Container Paths
 - `/opt/eclipse-mat/ParseHeapDump.sh` — MAT executable
@@ -166,9 +206,10 @@ Upload .hprof → Save to /heapdumps → Run MAT (subprocess) → Generate ZIPs 
 1. **MAT is x86-ONLY** — Apple Silicon users MUST add `--platform linux/amd64` to every Docker command. Omitting this silently fails.
 2. **MAT JVM heap must be >= 2x dump size** — For a 10 GB heap dump, MAT needs 20+ GB. Default `-Xmx32g` covers dumps up to ~16 GB. Override by mounting a custom `MemoryAnalyzer.ini`.
 3. **European locale numbers in MAT HTML** — MAT may emit `"1.234,56 %"` instead of `"1234.56 %"`. Parsers in `suspects.py` handle both formats with fallback logic.
-4. **ZIP cleanup after analysis** — `app.py` deletes generated MAT ZIPs after analysis to prevent filling `/reports`. This is intentional.
-5. **File uploads are chunked** — `app.py` reads uploads in 1 MB chunks to avoid buffering entire dumps in memory.
+4. **ZIP cleanup after analysis** — `services/analysis_service.py` deletes generated MAT ZIPs after analysis to prevent filling `/reports`. This is intentional.
+5. **File uploads are chunked** — `services/analysis_service.py` reads uploads in 1 MB chunks with a configurable size limit (`MAX_UPLOAD_SIZE_BYTES`, default 20 GB).
 6. **Thread-pool offloading** — MAT and analyzer execution run in executor pool (CPU-bound work), awaited by async FastAPI routes.
+7. **Lazy config singletons** — Analyzers call `get_*_thresholds()` internally (not via constructor) to preserve the `analyzer_cls(report_path, out_dir)` call pattern.
 
 ## Code Style
 - Python: standard library conventions, no formatter configured
