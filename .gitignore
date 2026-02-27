@@ -1,0 +1,27 @@
+# ── Java ──────────────────────────────────────────────────────────────────────
+demo/target/
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# ── Runtime data (heap dumps and generated reports) ───────────────────────────
+heapdumps/*.hprof
+reports/
+!reports/.DS_Store
+
+# ── IDE / OS ──────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# ── Docker layer cache helpers ────────────────────────────────────────────────
+.dockerignore
