@@ -14,11 +14,10 @@ structured, actionable diagnostics.
 4. [API Reference](#api-reference)
 5. [Generate Heap Dumps](#generate-heap-dumps)
 6. [Batch Analysis](#batch-analysis)
-7. [CLI Usage (without REST service)](#cli-usage-without-rest-service)
-8. [Configuration](#configuration)
-9. [Running Tests](#running-tests)
-10. [Project Structure](#project-structure)
-11. [Troubleshooting](#troubleshooting)
+7. [Configuration](#configuration)
+8. [Running Tests](#running-tests)
+9. [Project Structure](#project-structure)
+10. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -206,7 +205,7 @@ System packages installed via `microdnf`:
 | Package | Purpose |
 |---------|---------|
 | `python3` | CPython 3.9 interpreter |
-| `bash` | Shell for entrypoint and analysis scripts |
+| `bash` | Shell for entrypoint script |
 | `unzip` | Extracting ZIP report contents at runtime |
 | `fontconfig` | Font configuration library required by Java AWT/BIRT chart rendering |
 | `dejavu-sans-fonts` | Basic font set for MAT pie charts and report graphics |
@@ -222,7 +221,7 @@ Artefacts copied from builder stages:
 | `rpm-builder` | `/opt/eclipse-mat` | Eclipse MAT 1.16.1 |
 | `pip-builder` | `/opt/venv` | Python virtual environment with all dependencies |
 | Build context | `/opt/mat-service` | FastAPI application and analyzers |
-| Build context | `/usr/local/bin/*.sh` | Container scripts (entrypoint, analyze, oql, report) |
+| Build context | `/usr/local/bin/entrypoint.sh` | Container entrypoint script |
 
 ### Image Details
 
@@ -249,6 +248,53 @@ Artefacts copied from builder stages:
 | `/usr/local/bin/entrypoint.sh` | Container entrypoint |
 | `/heapdumps` | Upload directory for `.hprof` files (volume mount) |
 | `/reports` | Output directory for MAT ZIP reports (volume mount) |
+
+### Why Not `ubi9-micro`?
+
+The runtime stage uses `ubi9-minimal` rather than the smaller `ubi9-micro`. This is
+a deliberate choice — `ubi9-micro` is designed for single statically-compiled
+binaries (Go, Rust, GraalVM native-image) and lacks the runtime infrastructure
+this service requires.
+
+**No package manager.** `ubi9-micro` ships without `microdnf`, `dnf`, or any RPM
+database. The runtime stage installs five packages (`python3`, `bash`, `unzip`,
+`fontconfig`, `dejavu-sans-fonts`) via `microdnf install`. This is impossible on
+`ubi9-micro`.
+
+**Missing shared libraries.** CPython, lxml, and Java AWT depend on shared
+libraries that exist in `ubi9-minimal` but not in `ubi9-micro`:
+
+| Library | Required By |
+|---------|-------------|
+| `libpython3.9.so` | CPython interpreter (FastAPI / uvicorn) |
+| `libxml2.so.2`, `libxslt.so.1` | lxml (HTML parsing for MAT reports) |
+| `libfontconfig.so.1`, `libfreetype.so.6` | Java AWT font rendering (MAT charts) |
+| `libffi.so`, `libssl.so`, `libcrypto.so` | CPython stdlib (ctypes, ssl, hashlib) |
+| `libharfbuzz.so.0`, `libpng16.so.16`, `libexpat.so.1` | Transitive deps of freetype / fontconfig |
+
+**Fontconfig requires more than libraries.** Java AWT uses fontconfig to discover
+fonts for chart rendering. Fontconfig needs configuration files (`/etc/fonts/`),
+pre-built cache (`/usr/lib/fontconfig/cache/`), and actual font files
+(`/usr/share/fonts/`). Without a coherent fontconfig installation, Java's
+`X11FontManager` throws `"Fontconfig head is null"` and MAT report generation
+fails — a [known issue on ubi9-micro](https://github.com/quarkusio/quarkus/issues/49226).
+
+**Multi-stage COPY workarounds are fragile.** You can technically COPY individual
+`.so` files and font assets from a builder stage (the
+[Quarkus AWT Dockerfile](https://github.com/quarkusio/quarkus-quickstarts/blob/main/awt-graphics-rest-quickstart/src/main/docker/Dockerfile.native-micro)
+demonstrates this pattern), but:
+
+- Library paths change between UBI minor releases, silently breaking builds
+- Transitive dependency discovery is manual — when Red Hat updates fontconfig or
+  freetype and adds a new dependency, the build succeeds but the container crashes
+- Font cache files are architecture-specific binaries that must match the freetype
+  version; stale caches cause null-pointer crashes
+- The CPython ABI coupling means the interpreter, stdlib `.so` extensions, and venv
+  must all come from the same build — approximately 2000+ files to COPY manually
+
+For this service, the ~5 MB overhead of `ubi9-minimal` over `ubi9-micro` buys a
+working package manager and eliminates a fragile manifest of 30+ individual library
+paths. The trade-off strongly favours `ubi9-minimal`.
 
 ---
 
@@ -337,18 +383,6 @@ jcmd <PID> GC.heap_dump ./heapdumps/myapp.hprof
 -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/heapdumps/oom.hprof
 ```
 
-### Option C -- Generate MAT reports inside Docker
-
-```bash
-docker run --rm --platform linux/amd64 \
-  -v $(pwd)/heapdumps:/heapdumps \
-  -v $(pwd)/reports:/reports \
-  eclipse-mat analyze /heapdumps/myapp.hprof all
-```
-
-This writes `Leak_Suspects.zip`, `System_Overview.zip`, and `Top_Components.zip`
-into `reports/` without starting the REST service.
-
 ---
 
 ## Batch Analysis
@@ -389,41 +423,6 @@ ls ./heapdumps/*.hprof | parallel -j4 \
   'name=$(basename {} .hprof); \
    curl -s -X POST http://localhost:8080/analyze/heapdump/report \
         -F "file=@{}" > ./reports/text/${name}.txt && echo "done: $name"'
-```
-
----
-
-## CLI Usage (without REST service)
-
-### Inside Docker
-
-```bash
-# Leak Suspects
-docker run --rm --platform linux/amd64 \
-  -v $(pwd)/reports:/reports \
-  eclipse-mat py-suspects /reports/myapp_Leak_Suspects.zip
-
-# System Overview
-docker run --rm --platform linux/amd64 \
-  -v $(pwd)/reports:/reports \
-  eclipse-mat py-overview /reports/myapp_System_Overview.zip
-
-# Top Components
-docker run --rm --platform linux/amd64 \
-  -v $(pwd)/reports:/reports \
-  eclipse-mat py-top-components /reports/myapp_Top_Components.zip
-```
-
-### Analyse pre-generated ZIPs via REST
-
-```bash
-curl -X POST http://localhost:8080/analyze/all \
-     -H "Content-Type: application/json" \
-     -d '{"reports_dir": "/reports"}'
-
-curl -X POST http://localhost:8080/analyze/suspects \
-     -H "Content-Type: application/json" \
-     -d '{"report_path": "/reports/myapp_Leak_Suspects.zip"}'
 ```
 
 ---
@@ -559,9 +558,6 @@ eclipse-mat-service/
 │   ├── app.py                          # FastAPI application (routes, MAT subprocess runner)
 │   ├── requirements.txt                # Python dependencies (production)
 │   ├── requirements-test.txt           # Test dependencies (pytest, httpx)
-│   ├── mat_suspect_analyzer.py         # CLI shim -> analyzers/suspects.py
-│   ├── mat_system_overview_analyzer.py # CLI shim -> analyzers/overview.py
-│   ├── mat_top_components_analyzer.py  # CLI shim -> analyzers/top_components.py
 │   ├── analyzers/
 │   │   ├── __init__.py                 # Exports three analyzer classes
 │   │   ├── base.py                     # MATBaseAnalyzer: ZIP extraction, HTML parsing,
@@ -579,11 +575,8 @@ eclipse-mat-service/
 ├── docker/                             # Docker build
 │   ├── Dockerfile                      # 3-stage multi-stage build (UBI9-minimal)
 │   └── scripts/
-│       ├── entrypoint.sh               # CMD dispatcher (service|analyze|oql|shell|...)
-│       ├── analyze-heapdump.sh         # Shell wrapper for MAT ParseHeapDump.sh
-│       ├── oql-analyze.sh              # OQL query runner
-│       ├── report_script.sh            # Extracts Problem Suspects from a ZIP
-│       └── unpackRPM.sh               # Extracts RPMs via rpm2cpio
+│       ├── entrypoint.sh               # REST service entrypoint
+│       └── unpackRPM.sh               # Extracts RPMs via rpm2cpio (build-time)
 │
 ├── demo/                               # Java demo application
 │   ├── src/

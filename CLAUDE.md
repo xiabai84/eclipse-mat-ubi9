@@ -1,6 +1,7 @@
 ## Workflow Orchestration
 
 ### 1. Plan Node Default
+- Use superpowers plugin as default
 - Enter plan mode for ANY non-trivial task (3+ steps or architectural decisions)
 - If something goes sideways, STOP and re-plan immediately - don't keep pushing
 - Use plan mode for verification steps, not just building
@@ -99,21 +100,12 @@ curl -s -X POST http://localhost:8080/analyze/heapdump -F "file=@./heapdumps/mya
 curl -s -X POST http://localhost:8080/analyze/heapdump/report -F "file=@./heapdumps/myapp.hprof"
 ```
 
-### Run Analyzers Locally (no Docker)
-```bash
-pip install -r backend/requirements.txt
-python3 backend/mat_suspect_analyzer.py ./reports/myapp_Leak_Suspects.zip
-```
-
 ## Architecture
 
 ```
 backend/
 ├── app.py                    # FastAPI application (all routes, MAT subprocess runner)
 ├── requirements.txt          # Python dependencies
-├── mat_suspect_analyzer.py   # CLI shim (backward compat)
-├── mat_system_overview_analyzer.py
-├── mat_top_components_analyzer.py
 └── analyzers/
     ├── __init__.py           # Exports three analyzer classes
     ├── base.py               # MATBaseAnalyzer (abstract): ZIP extraction, HTML parsing, Java recommendations engine
@@ -124,9 +116,8 @@ backend/
 docker/
 ├── Dockerfile                # 3-stage build: rpm-builder → pip-builder → runtime
 └── scripts/
-    ├── entrypoint.sh         # Command dispatcher (service|analyze|oql|shell|...)
-    ├── analyze-heapdump.sh   # Shell wrapper for MAT ParseHeapDump.sh
-    └── unpackRPM.sh          # RPM extraction for multi-stage
+    ├── entrypoint.sh         # REST service entrypoint
+    └── unpackRPM.sh          # RPM extraction for multi-stage (build-time)
 
 demo/
 ├── src/JavaMemoryIssuesDemo.java  # 7 memory leak scenarios for testing

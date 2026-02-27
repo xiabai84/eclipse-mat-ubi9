@@ -180,10 +180,7 @@ COPY --from=pip-builder /opt/venv /opt/venv
 # ── Application code and scripts ────────────────────────────────────────────
 COPY backend/ /opt/mat-service/
 COPY docker/scripts/entrypoint.sh     /usr/local/bin/entrypoint.sh
-COPY docker/scripts/analyze-heapdump.sh /usr/local/bin/analyze-heapdump.sh
-COPY docker/scripts/oql-analyze.sh    /usr/local/bin/oql-analyze.sh
-COPY docker/scripts/report_script.sh  /usr/local/bin/report_script.sh
-RUN chmod 755 /usr/local/bin/*.sh \
+RUN chmod 755 /usr/local/bin/entrypoint.sh \
     && chmod -R a+rX /opt/mat-service /opt/venv
 
 # ── Environment ─────────────────────────────────────────────────────────────

@@ -660,32 +660,3 @@ class MATTopComponentsAnalyzer(MATBaseAnalyzer):
         lines.append(self.build_summary())
 
         return "\n".join(lines)
-
-
-# ── CLI entry point ───────────────────────────────────────────────────────────
-
-def main() -> int:
-    import argparse
-
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    parser = argparse.ArgumentParser(description="Analyse MAT Top Components report")
-    parser.add_argument("zip_file", help="Path to *_Top_Components.zip")
-    parser.add_argument("-o", "--output", help="Output directory")
-    parser.add_argument("--json", action="store_true", help="Also save JSON data")
-    args = parser.parse_args()
-
-    try:
-        analyzer = MATTopComponentsAnalyzer(args.zip_file, args.output)
-        analyzer.analyze()
-        print(analyzer.generate_report())
-        analyzer.save_report()
-        if args.json:
-            analyzer.save_json()
-        return 1 if analyzer.report_data["problems"] else 0
-    except Exception as exc:
-        logger.exception("Analysis failed: %s", exc)
-        return 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

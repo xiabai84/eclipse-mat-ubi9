@@ -1,6 +1,6 @@
 #!/bin/bash
 # Eclipse MAT container entrypoint
-# Dispatches to MAT analysis commands or starts the Python REST service.
+# Starts the Python REST service for heap dump analysis.
 
 set -e
 
@@ -15,86 +15,30 @@ case "$1" in
             --log-level info
         ;;
 
-    oql)
-        shift
-        exec oql-analyze.sh "$@"
-        ;;
-
-    analyze)
-        shift
-        exec analyze-heapdump.sh "$@"
-        ;;
-
-    parse)
-        shift
-        exec /opt/eclipse-mat/ParseHeapDump.sh "$@"
-        ;;
-
-    shell)
-        exec /bin/bash
-        ;;
-
-    py-suspects)
-        # Run the suspects analyzer directly (convenience shortcut)
-        shift
-        exec python3 /opt/mat-service/mat_suspect_analyzer.py "$@"
-        ;;
-
-    py-overview)
-        shift
-        exec python3 /opt/mat-service/mat_system_overview_analyzer.py "$@"
-        ;;
-
-    py-top-components)
-        shift
-        exec python3 /opt/mat-service/mat_top_components_analyzer.py "$@"
-        ;;
-
     --help|-h|"")
         cat <<EOF
-Eclipse MAT Headless Analyzer + Python Analysis Service
+Eclipse MAT Heap Analysis REST Service
 
 Usage:
-  docker run -v \$(pwd)/heapdumps:/heapdumps:ro \\
+  docker run -v \$(pwd)/heapdumps:/heapdumps \\
              -v \$(pwd)/reports:/reports \\
-             [-p 8080:8080] \\
-             eclipse-mat <command>
+             -p 8080:8080 \\
+             eclipse-mat [service]
 
 Commands:
-  service                          Start the Python REST analysis service (default)
-  analyze <dump.hprof> [type]      Generate MAT reports via ParseHeapDump.sh
-                                   Types: leak_suspects | overview | top_components | all
-  oql <script.oql> <dump.hprof>   Run an OQL query against a heap dump
-  parse <dump.hprof> <report>      Raw ParseHeapDump.sh pass-through
-  shell                            Open a bash shell
+  service   Start the REST analysis service (default)
+  --help    Show this help message
 
-  py-suspects   <report.zip>       Run standalone Leak Suspects analyser
-  py-overview   <report.zip>       Run standalone System Overview analyser
-  py-top-components <report.zip>   Run standalone Top Components analyser
-
-REST API (when running 'service'):
-  GET  http://localhost:8080/health
-  GET  http://localhost:8080/reports
-  POST http://localhost:8080/analyze/suspects
-  POST http://localhost:8080/analyze/overview
-  POST http://localhost:8080/analyze/top-components
-  POST http://localhost:8080/analyze/all
-  GET  http://localhost:8080/docs     (OpenAPI / Swagger UI)
-
-Example — full workflow:
-  # 1. Generate MAT reports from a heap dump
-  docker run -v \$(pwd)/heapdumps:/heapdumps:ro \\
-             -v \$(pwd)/reports:/reports \\
-             eclipse-mat analyze /heapdumps/app.hprof all
-
-  # 2. Start the service and query the reports
-  docker run -p 8080:8080 \\
-             -v \$(pwd)/reports:/reports \\
-             eclipse-mat service
-
-  curl -X POST http://localhost:8080/analyze/all \\
-       -H "Content-Type: application/json" \\
-       -d '{"reports_dir": "/reports"}'
+REST API:
+  GET  http://localhost:8080/health              Liveness probe
+  GET  http://localhost:8080/reports             List ZIP reports
+  POST http://localhost:8080/analyze/heapdump    Upload .hprof -> JSON analysis
+  POST http://localhost:8080/analyze/heapdump/report  Upload .hprof -> text report
+  POST http://localhost:8080/analyze/suspects    Analyse Leak Suspects ZIP
+  POST http://localhost:8080/analyze/overview    Analyse System Overview ZIP
+  POST http://localhost:8080/analyze/top-components  Analyse Top Components ZIP
+  POST http://localhost:8080/analyze/all         Auto-discover & run all analysers
+  GET  http://localhost:8080/docs                OpenAPI / Swagger UI
 EOF
         exit 0
         ;;
