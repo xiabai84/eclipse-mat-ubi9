@@ -395,9 +395,10 @@ async def _heapdump_pipeline(
         )
 
     # ── Run Python analysers (CPU-bound → thread pool) ────────────────────────
+    analyzer_tmp = tempfile.mkdtemp(prefix="mat_analysis_")
     logger.info("Running Python analysers on %s…", rpt_dir)
     analysis = await loop.run_in_executor(
-        None, _run_all_analyzers, rpt_dir, None, True   # always generate text
+        None, _run_all_analyzers, rpt_dir, analyzer_tmp, True   # always generate text
     )
 
     # ── Delete temporary ZIPs (keep /reports clean) ───────────────────────────
@@ -407,6 +408,20 @@ async def _heapdump_pipeline(
             logger.info("Deleted temporary MAT report: %s", zip_path)
         except Exception as exc:
             logger.warning("Could not delete %s: %s", zip_path, exc)
+
+    # ── Delete uploaded .hprof — analysis is complete, no longer needed ──────
+    try:
+        dest.unlink(missing_ok=True)
+        logger.info("Deleted uploaded heap dump: %s", dest)
+    except Exception as exc:
+        logger.warning("Could not delete %s: %s", dest, exc)
+
+    # ── Delete analyzer temp directory (extracted HTML, etc.) ────────────────
+    try:
+        shutil.rmtree(analyzer_tmp, ignore_errors=True)
+        logger.info("Deleted analyzer temp dir: %s", analyzer_tmp)
+    except Exception as exc:
+        logger.warning("Could not delete %s: %s", analyzer_tmp, exc)
 
     return filename, size_mb, dest, mat_result, analysis
 
