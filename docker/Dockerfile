@@ -191,6 +191,11 @@ ENV JAVA_HOME=/usr/lib/jvm/jre-17-openjdk \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
+# ── Company CA certificates (uncomment to add) ────────────────────────────
+# Place PEM-formatted .crt files in certs/ at the project root, then:
+# COPY certs/*.crt /etc/pki/ca-trust/source/anchors/
+# RUN update-ca-trust
+
 # ── Non-root user ───────────────────────────────────────────────────────────
 RUN echo "mat:x:1001:1001::/home/mat:/sbin/nologin" >> /etc/passwd \
     && echo "mat:x:1001:" >> /etc/group
