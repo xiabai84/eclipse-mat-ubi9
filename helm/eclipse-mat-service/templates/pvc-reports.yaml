@@ -1,0 +1,17 @@
+{{- if .Values.persistence.reports.enabled -}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "eclipse-mat-service.fullname" . }}-reports
+  labels:
+    {{- include "eclipse-mat-service.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - {{ .Values.persistence.reports.accessMode }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.reports.size }}
+  {{- if .Values.persistence.reports.storageClassName }}
+  storageClassName: {{ .Values.persistence.reports.storageClassName | quote }}
+  {{- end }}
+{{- end }}

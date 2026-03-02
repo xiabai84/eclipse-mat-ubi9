@@ -1,0 +1,17 @@
+{{- if .Values.persistence.heapdumps.enabled -}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "eclipse-mat-service.fullname" . }}-heapdumps
+  labels:
+    {{- include "eclipse-mat-service.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - {{ .Values.persistence.heapdumps.accessMode }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.heapdumps.size }}
+  {{- if .Values.persistence.heapdumps.storageClassName }}
+  storageClassName: {{ .Values.persistence.heapdumps.storageClassName | quote }}
+  {{- end }}
+{{- end }}

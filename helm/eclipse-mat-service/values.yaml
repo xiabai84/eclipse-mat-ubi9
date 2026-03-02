@@ -1,0 +1,141 @@
+# -- Number of pod replicas (MAT is CPU/memory-bound; 1 is recommended)
+replicaCount: 1
+
+image:
+  # -- Container image repository
+  repository: eclipse-mat
+  # -- Image tag
+  tag: latest
+  # -- Image pull policy
+  pullPolicy: IfNotPresent
+
+# -- Image pull secrets for private registries
+imagePullSecrets: []
+
+# -- Override the chart name
+nameOverride: ""
+# -- Override the full release name
+fullnameOverride: ""
+
+serviceAccount:
+  # -- Create a dedicated ServiceAccount
+  create: true
+  # -- Annotations for the ServiceAccount
+  annotations: {}
+  # -- Override the ServiceAccount name
+  name: ""
+
+service:
+  # -- Service type
+  type: ClusterIP
+  # -- Service port
+  port: 8080
+
+route:
+  # -- Create an OpenShift Route
+  enabled: true
+  # -- Annotations for the Route
+  annotations: {}
+  # -- Hostname override (leave empty for auto-generated)
+  host: ""
+  tls:
+    # -- TLS termination type (edge, passthrough, reencrypt)
+    termination: edge
+    # -- Redirect HTTP to HTTPS
+    insecureEdgeTerminationPolicy: Redirect
+
+resources:
+  requests:
+    memory: "4Gi"
+    cpu: "1"
+  limits:
+    memory: "16Gi"
+    cpu: "4"
+
+persistence:
+  heapdumps:
+    # -- Enable PVC for /heapdumps
+    enabled: true
+    # -- Storage size for heapdumps
+    size: 50Gi
+    # -- Storage class (empty = cluster default)
+    storageClassName: ""
+    # -- Access mode
+    accessMode: ReadWriteOnce
+  reports:
+    # -- Enable PVC for /reports
+    enabled: true
+    # -- Storage size for reports
+    size: 10Gi
+    # -- Storage class (empty = cluster default)
+    storageClassName: ""
+    # -- Access mode
+    accessMode: ReadWriteOnce
+
+# -- Pod-level security context
+podSecurityContext:
+  runAsUser: 1001
+  runAsNonRoot: true
+  fsGroup: 1001
+
+# -- Container-level security context
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop:
+      - ALL
+
+# -- Node selector labels
+nodeSelector: {}
+
+# -- Tolerations for pod scheduling
+tolerations: []
+
+# -- Affinity rules for pod scheduling
+affinity: {}
+
+# -- Additional pod annotations
+podAnnotations: {}
+
+# -- Additional pod labels
+podLabels: {}
+
+# -- Application configuration (mapped to env vars via ConfigMap)
+config:
+  matTimeout: "600"
+  uvicornWorkers: "4"
+  logLevel: "INFO"
+  logJson: "false"
+  maxUploadSizeBytes: "21474836480"
+  # -- Suspects analyzer thresholds (SUSPECTS_ prefix)
+  suspects:
+    primaryLeakHighMb: "500"
+    significantSuspectMb: "50"
+    significantSuspectRatio: "0.2"
+    secondaryLeakHighMb: "200"
+    heapLeakCriticalPct: "70"
+    heapLeakWarningPct: "40"
+  # -- Overview analyzer thresholds (OVERVIEW_ prefix)
+  overview:
+    largeHeapHighMb: "2048"
+    largeHeapMediumMb: "1024"
+    highObjectCount: "1000000"
+    elevatedObjectCount: "500000"
+    highClassloaderCount: "20"
+    elevatedClassloaderCount: "10"
+    highGcRootCount: "5000"
+    threadLeakMb: "50"
+    threadLeakSevereMb: "100"
+    largeArrayMb: "100"
+    largeStringMb: "100"
+    largeCacheMb: "100"
+  # -- Top Components analyzer thresholds (TOP_COMPONENTS_ prefix)
+  topComponents:
+    dominantClassloaderMb: "200"
+    dominantClassloaderHighPct: "50"
+    dominantConsumerMb: "500"
+    dominantConsumerPct: "40"
+    largeConsumerMb: "100"
+    wasteProblemMb: "50"
+    wasteWarningMb: "10"

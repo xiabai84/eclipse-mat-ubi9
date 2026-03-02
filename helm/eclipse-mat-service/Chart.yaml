@@ -1,0 +1,12 @@
+apiVersion: v2
+name: eclipse-mat-service
+description: Eclipse MAT heap analysis service for OpenShift
+type: application
+version: 0.1.0
+appVersion: "3.1.0"
+keywords:
+  - eclipse-mat
+  - heap-analysis
+  - java
+  - memory-profiling
+home: https://github.com/xiabai84/eclipse-mat-service

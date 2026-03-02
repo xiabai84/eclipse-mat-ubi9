@@ -1,0 +1,41 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "eclipse-mat-service.fullname" . }}
+  labels:
+    {{- include "eclipse-mat-service.labels" . | nindent 4 }}
+data:
+  # Core settings
+  MAT_TIMEOUT: {{ .Values.config.matTimeout | quote }}
+  UVICORN_WORKERS: {{ .Values.config.uvicornWorkers | quote }}
+  LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+  LOG_JSON: {{ .Values.config.logJson | quote }}
+  MAX_UPLOAD_SIZE_BYTES: {{ .Values.config.maxUploadSizeBytes | quote }}
+  # Suspects analyzer thresholds
+  SUSPECTS_PRIMARY_LEAK_HIGH_MB: {{ .Values.config.suspects.primaryLeakHighMb | quote }}
+  SUSPECTS_SIGNIFICANT_SUSPECT_MB: {{ .Values.config.suspects.significantSuspectMb | quote }}
+  SUSPECTS_SIGNIFICANT_SUSPECT_RATIO: {{ .Values.config.suspects.significantSuspectRatio | quote }}
+  SUSPECTS_SECONDARY_LEAK_HIGH_MB: {{ .Values.config.suspects.secondaryLeakHighMb | quote }}
+  SUSPECTS_HEAP_LEAK_CRITICAL_PCT: {{ .Values.config.suspects.heapLeakCriticalPct | quote }}
+  SUSPECTS_HEAP_LEAK_WARNING_PCT: {{ .Values.config.suspects.heapLeakWarningPct | quote }}
+  # Overview analyzer thresholds
+  OVERVIEW_LARGE_HEAP_HIGH_MB: {{ .Values.config.overview.largeHeapHighMb | quote }}
+  OVERVIEW_LARGE_HEAP_MEDIUM_MB: {{ .Values.config.overview.largeHeapMediumMb | quote }}
+  OVERVIEW_HIGH_OBJECT_COUNT: {{ .Values.config.overview.highObjectCount | quote }}
+  OVERVIEW_ELEVATED_OBJECT_COUNT: {{ .Values.config.overview.elevatedObjectCount | quote }}
+  OVERVIEW_HIGH_CLASSLOADER_COUNT: {{ .Values.config.overview.highClassloaderCount | quote }}
+  OVERVIEW_ELEVATED_CLASSLOADER_COUNT: {{ .Values.config.overview.elevatedClassloaderCount | quote }}
+  OVERVIEW_HIGH_GC_ROOT_COUNT: {{ .Values.config.overview.highGcRootCount | quote }}
+  OVERVIEW_THREAD_LEAK_MB: {{ .Values.config.overview.threadLeakMb | quote }}
+  OVERVIEW_THREAD_LEAK_SEVERE_MB: {{ .Values.config.overview.threadLeakSevereMb | quote }}
+  OVERVIEW_LARGE_ARRAY_MB: {{ .Values.config.overview.largeArrayMb | quote }}
+  OVERVIEW_LARGE_STRING_MB: {{ .Values.config.overview.largeStringMb | quote }}
+  OVERVIEW_LARGE_CACHE_MB: {{ .Values.config.overview.largeCacheMb | quote }}
+  # Top Components analyzer thresholds
+  TOP_COMPONENTS_DOMINANT_CLASSLOADER_MB: {{ .Values.config.topComponents.dominantClassloaderMb | quote }}
+  TOP_COMPONENTS_DOMINANT_CLASSLOADER_HIGH_PCT: {{ .Values.config.topComponents.dominantClassloaderHighPct | quote }}
+  TOP_COMPONENTS_DOMINANT_CONSUMER_MB: {{ .Values.config.topComponents.dominantConsumerMb | quote }}
+  TOP_COMPONENTS_DOMINANT_CONSUMER_PCT: {{ .Values.config.topComponents.dominantConsumerPct | quote }}
+  TOP_COMPONENTS_LARGE_CONSUMER_MB: {{ .Values.config.topComponents.largeConsumerMb | quote }}
+  TOP_COMPONENTS_WASTE_PROBLEM_MB: {{ .Values.config.topComponents.wasteProblemMb | quote }}
+  TOP_COMPONENTS_WASTE_WARNING_MB: {{ .Values.config.topComponents.wasteWarningMb | quote }}

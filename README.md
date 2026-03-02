@@ -563,6 +563,51 @@ collisions across instances.
 
 ---
 
+## Deploy on OpenShift (Helm)
+
+A Helm chart is provided at `helm/eclipse-mat-service/` for deploying on OpenShift.
+
+```bash
+# Install
+helm install mat-service helm/eclipse-mat-service/ \
+  --set image.repository=your-registry.io/eclipse-mat \
+  --set image.tag=latest
+
+# Custom values file
+helm install mat-service helm/eclipse-mat-service/ -f my-values.yaml
+
+# Upgrade
+helm upgrade mat-service helm/eclipse-mat-service/
+
+# Uninstall
+helm uninstall mat-service
+```
+
+The chart creates: Deployment, Service (ClusterIP), OpenShift Route (TLS edge),
+two PVCs (`/heapdumps` 50Gi, `/reports` 10Gi), ConfigMap (all env vars), and
+ServiceAccount. All values are configurable — see `helm/eclipse-mat-service/values.yaml`.
+
+Key overrides:
+
+```bash
+# Large production instance
+helm install mat-service helm/eclipse-mat-service/ \
+  --set resources.requests.memory=8Gi \
+  --set resources.limits.memory=40Gi \
+  --set persistence.heapdumps.size=200Gi \
+  --set config.matTimeout=3600
+
+# Disable Route (internal-only)
+helm install mat-service helm/eclipse-mat-service/ --set route.enabled=false
+
+# Disable persistent storage (ephemeral)
+helm install mat-service helm/eclipse-mat-service/ \
+  --set persistence.heapdumps.enabled=false \
+  --set persistence.reports.enabled=false
+```
+
+---
+
 ## Running Tests
 
 ```bash
@@ -621,6 +666,20 @@ eclipse-mat-service/
 │   ├── src/
 │   │   └── JavaMemoryIssuesDemo.java  # 7 memory-issue scenarios
 │   └── run-demo.sh                     # Compile & run helper
+│
+├── helm/                               # Helm chart for OpenShift deployment
+│   └── eclipse-mat-service/
+│       ├── Chart.yaml                  # Chart metadata (v0.1.0, appVersion 3.1.0)
+│       ├── values.yaml                 # All configurable defaults
+│       └── templates/                  # K8s/OpenShift resource templates
+│           ├── _helpers.tpl            # Template helper functions
+│           ├── deployment.yaml         # Deployment with probes, PVCs, ConfigMap
+│           ├── service.yaml            # ClusterIP Service (port 8080)
+│           ├── route.yaml              # OpenShift Route (TLS edge)
+│           ├── configmap.yaml          # All env vars from config.py
+│           ├── pvc-heapdumps.yaml      # PVC for /heapdumps (50Gi)
+│           ├── pvc-reports.yaml        # PVC for /reports (10Gi)
+│           └── serviceaccount.yaml     # ServiceAccount with pull secrets
 │
 ├── heapdumps/                          # Volume mount: .hprof files
 └── reports/                            # Volume mount: MAT ZIP reports

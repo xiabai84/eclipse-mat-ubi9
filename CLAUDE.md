@@ -91,6 +91,15 @@ chmod +x demo/run-demo.sh
 ./demo/run-demo.sh 3        # Single scenario
 ```
 
+### Deploy on OpenShift (Helm)
+```bash
+helm install mat-service helm/eclipse-mat-service/ \
+  --set image.repository=your-registry.io/eclipse-mat \
+  --set image.tag=latest
+helm lint helm/eclipse-mat-service/
+helm template test helm/eclipse-mat-service/
+```
+
 ### Analyze Heap Dumps
 ```bash
 # JSON response
@@ -130,6 +139,11 @@ docker/
 └── scripts/
     ├── entrypoint.sh         # REST service entrypoint
     └── unpackRPM.sh          # RPM extraction for multi-stage (build-time)
+
+helm/eclipse-mat-service/             # Helm chart for OpenShift deployment
+├── Chart.yaml                        # Chart metadata
+├── values.yaml                       # All configurable defaults
+└── templates/                        # K8s/OpenShift resource templates (7 resources)
 
 demo/
 ├── src/JavaMemoryIssuesDemo.java  # 7 memory leak scenarios for testing
