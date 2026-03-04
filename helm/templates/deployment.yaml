@@ -39,6 +39,9 @@ spec:
             - name: http
               containerPort: 8080
               protocol: TCP
+          env:
+            - name: HOME
+              value: /home/mat
           envFrom:
             - configMapRef:
                 name: {{ include "eclipse-mat-service.fullname" . }}
@@ -61,6 +64,12 @@ spec:
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: home-mat
+              mountPath: /home/mat
+            - name: mat-workspace
+              mountPath: /opt/eclipse-mat/workspace
             {{- if .Values.persistence.heapdumps.enabled }}
             - name: heapdumps
               mountPath: /heapdumps
@@ -70,6 +79,12 @@ spec:
               mountPath: /reports
             {{- end }}
       volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: home-mat
+          emptyDir: {}
+        - name: mat-workspace
+          emptyDir: {}
         {{- if .Values.persistence.heapdumps.enabled }}
         - name: heapdumps
           persistentVolumeClaim:

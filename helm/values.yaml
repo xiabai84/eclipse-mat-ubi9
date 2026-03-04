@@ -35,7 +35,13 @@ route:
   # -- Create an OpenShift Route
   enabled: true
   # -- Annotations for the Route
-  annotations: {}
+  # HAProxy timeout must accommodate large heap dump uploads + MAT analysis time
+  annotations:
+    haproxy.router.openshift.io/timeout: "1800s"
+    haproxy.router.openshift.io/proxy-body-size: "20g"
+    haproxy.router.openshift.io/proxy-connect-timeout: "60s"
+    haproxy.router.openshift.io/proxy-read-timeout: "1800s"
+    haproxy.router.openshift.io/proxy-send-timeout: "1800s"
   # -- Hostname override (leave empty for auto-generated)
   host: ""
   tls:
@@ -73,10 +79,10 @@ persistence:
     accessMode: ReadWriteOnce
 
 # -- Pod-level security context
+# Note: Do NOT set runAsUser/fsGroup to fixed UIDs on OpenShift.
+# OpenShift assigns UIDs from the namespace's allocated range via SCCs.
 podSecurityContext:
-  runAsUser: 1001
   runAsNonRoot: true
-  fsGroup: 1001
 
 # -- Container-level security context
 securityContext:

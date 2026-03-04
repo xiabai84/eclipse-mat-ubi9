@@ -732,3 +732,110 @@ MAT is x86-only. Always add `--platform linux/amd64` to `docker build` and
 ```bash
 pip install -r backend/requirements.txt
 ```
+
+---
+
+## OpenShift Troubleshooting
+
+**`pod is forbidden: unable to validate against any security context constraint` / `runAsUser: Invalid value: 1001`**
+
+OpenShift enforces namespace-specific UID ranges via Security Context Constraints
+(SCCs). Do **not** set `runAsUser` or `fsGroup` to fixed UIDs in the Helm chart.
+The default `values.yaml` uses only `runAsNonRoot: true` and lets OpenShift assign
+a UID from the namespace's allocated range.
+
+If you see this error, check your values override:
+
+```bash
+# Wrong — fixed UID conflicts with OpenShift SCC
+podSecurityContext:
+  runAsUser: 1001
+  fsGroup: 1001
+
+# Correct — let OpenShift assign the UID
+podSecurityContext:
+  runAsNonRoot: true
+```
+
+**`no usable temporary directory found in [/tmp, /var/tmp, /usr/tmp, /home/mat]`**
+
+The OpenShift-assigned UID cannot write to directories owned by UID 1001 in the
+Docker image. The Helm chart mounts `emptyDir` volumes at `/tmp`, `/home/mat`, and
+`/opt/eclipse-mat/workspace` to provide writable directories regardless of the
+assigned UID.
+
+If you still see this error, verify the `emptyDir` volumes are present:
+
+```bash
+oc get deployment <release-name> -o jsonpath='{.spec.template.spec.volumes[*].name}'
+# Expected: tmp home-mat mat-workspace heapdumps reports
+```
+
+**`there was an error parsing the body` (HTTP 400) on file upload**
+
+The OpenShift HAProxy router has a default request body size limit. The Helm chart
+sets `haproxy.router.openshift.io/proxy-body-size: 20g` on the Route. Verify the
+annotation is present:
+
+```bash
+oc get route <release-name> -o jsonpath='{.metadata.annotations}'
+```
+
+If uploading very large dumps (> 1 GB), also ensure the timeout annotations are
+sufficient:
+
+```yaml
+route:
+  annotations:
+    haproxy.router.openshift.io/timeout: "1800s"
+    haproxy.router.openshift.io/proxy-body-size: "20g"
+    haproxy.router.openshift.io/proxy-read-timeout: "1800s"
+    haproxy.router.openshift.io/proxy-send-timeout: "1800s"
+```
+
+**Upload returns empty response (HTTP status 0) or curl exit code 7**
+
+Two common causes:
+
+1. **Using `http://` instead of `https://`.** The Route redirects HTTP to HTTPS
+   (302). With large file uploads, the redirect silently drops the POST body.
+   Always use `https://`:
+
+   ```bash
+   curl -k -X POST https://<route>/analyze/heapdump/report \
+     -F "file=@./dump.hprof"
+   ```
+
+2. **HAProxy timeout during upload.** Large heap dumps can take minutes to upload.
+   Increase the Route timeout annotations (see above).
+
+**`No matching ZIP found` — MAT runs but produces no reports**
+
+MAT needs write access to its workspace directory inside `/opt/eclipse-mat/`. The
+Helm chart mounts an `emptyDir` at `/opt/eclipse-mat/workspace` for this purpose.
+
+If reports are still missing, check the MAT stderr output:
+
+```bash
+oc logs deployment/<release-name> | grep -i "error\|permission\|denied\|workspace"
+```
+
+Use the JSON endpoint to see the full MAT result including return code and stderr:
+
+```bash
+curl -k -X POST https://<route>/analyze/heapdump \
+  -F "file=@./dump.hprof" | python3 -m json.tool
+```
+
+Look at the `mat.returncode`, `mat.stderr_tail`, and `mat.reports_generated` fields.
+
+**Pod stuck in `CrashLoopBackOff`**
+
+Check logs for the root cause:
+
+```bash
+oc logs deployment/<release-name> --previous
+```
+
+Common causes: insufficient memory (MAT needs ~2x dump size in RAM), missing
+writable directories, or the readiness probe failing because uvicorn cannot start.
