@@ -93,15 +93,34 @@ class MATBaseAnalyzer(ABC):
 
     # ── Parsing helpers ───────────────────────────────────────────────────────
 
-    def _clean_text(self, text: str) -> str:
+    def _clean_text(self, text: str, raw_html: bool = False) -> str:
+        """Normalise text for output.
+
+        Callers mostly pass BeautifulSoup ``get_text()`` output, which is already plain text: there, ``<…>`` is
+        content (MAT writes ``<system class loader>``), not markup, and must stay. Only ``raw_html=True`` (regex
+        matches on the raw HTML) strips tags - before unescaping, so that escaped ``&lt;…&gt;`` survives.
+        """
         if not text:
             return ""
+        if raw_html:
+            text = re.sub(r"<[^>]+>", " ", text)
         text = html.unescape(text)
-        text = re.sub(r"<[^>]+>", " ", text)
         text = re.sub(r"[»›]|&raquo;|&rsaquo;", "", text)
         text = re.sub(r"Skip\s+to\s+main\s+content", "", text, flags=re.IGNORECASE)
         text = re.sub(r"\.{10,}", "…", text)       # MAT truncation dots
         return re.sub(r"\s+", " ", text).strip()
+
+    # MAT tree tables append how many objects a row stands for, and prefix path rows with tree glyphs
+    _TREE_SUFFIX = re.compile(
+        r"\s*(?:All objects|All [\d,.]+ objects|First [\d,.]+ of [\d,.]+ objects|Only object)\s*$", re.IGNORECASE)
+    _TREE_PREFIX = re.compile(r"^[\\.+|\s]+(?=[^\\.+|\s])")
+
+    def _clean_name(self, text: str) -> str:
+        """A class / object name from a MAT table cell, without tree glyphs and "All 5 objects" labels."""
+        name = self._clean_text(text)
+        name = self._TREE_SUFFIX.sub("", name)
+        name = self._TREE_PREFIX.sub("", name)
+        return name.strip()
 
     def _extract_text(self, element, max_len: int = 300) -> str:
         if element is None:
@@ -109,31 +128,50 @@ class MATBaseAnalyzer(ABC):
         raw = self._clean_text(element.get_text(separator=" ", strip=True))
         return raw[:max_len] + ("…" if len(raw) > max_len else "")
 
+    _SIZE = re.compile(r"(\d[\d.,' ]*)\s*(TB|GB|MB|KB|bytes?|B)?(?![A-Za-z])", re.IGNORECASE)
+    _UNIT_MB = {"TB": 1024 * 1024, "GB": 1024, "MB": 1, "KB": 1 / 1024}
+
+    @staticmethod
+    def _parse_decimal(num: str, integral: bool) -> float:
+        """A number as MAT prints it, in an English or a European locale.
+
+        ``integral`` (byte counts): every separator is a thousands separator - "83,892,400", "83.892.400".
+        Otherwise the last separator is the decimal one, unless it is followed by exactly three digits and is the
+        only kind of separator ("1,024 MB" vs. "81,8 MB" / "81.8 MB" / "1.234,5 MB").
+        """
+        num = num.strip().replace(" ", "").replace("'", "")
+        if integral:
+            return float(re.sub(r"[.,]", "", num) or 0)
+        seps = [c for c in num if c in ".,"]
+        if not seps:
+            return float(num)
+        last = max(num.rfind("."), num.rfind(","))
+        decimals = num[last + 1:]
+        if len(set(seps)) == 1 and len(decimals) == 3 and (len(seps) > 1 or seps[0] == ","):
+            return float(re.sub(r"[.,]", "", num))          # only thousands separators
+        return float(re.sub(r"[.,]", "", num[:last]) + "." + decimals)
+
     def _parse_size_to_mb(self, size_str: str) -> float:
         """
-        Convert a size string to MB.
-        Handles: "100 MB", "1.5 GB", "512 KB", "1,048,576 bytes",
-        and raw byte counts like "104,889,144" (no unit → assumed bytes).
-        MAT HTML table cells contain raw byte counts without any unit suffix.
+        Convert a size as MAT prints it to MB.
+
+        Handles units ("81.8 MB", "1.5 GB", "512 KB", "40 B"), European decimal commas ("81,8 MB"), raw byte counts
+        ("104,889,144" - MAT table cells have no unit), "bytes", and MAT's lower-bound notation (">= 84,487,384").
         """
         if not size_str:
             return 0.0
-        s = re.sub(r"(\d),(\d)", r"\1\2", str(size_str).strip())
-        # Explicit unit
-        m = re.search(r"([\d.]+)\s*(GB|MB|KB)\b", s, re.IGNORECASE)
-        if m:
-            val, unit = float(m.group(1)), m.group(2).upper()
-            return val * 1024 if unit == "GB" else val / 1024 if unit == "KB" else val
-        # "bytes" keyword
-        bm = re.search(r"([\d]+)\s*bytes?", s, re.IGNORECASE)
-        if bm:
-            return int(bm.group(1)) / 1_048_576
-        # Plain integer → assume bytes (MAT raw cell values)
-        pm = re.fullmatch(r"\s*([\d]+)\s*", s)
-        if pm:
-            n = int(pm.group(1))
-            return n / 1_048_576 if n >= 1024 else 0.0
-        return 0.0
+        s = re.sub(r"^\s*(?:>=|≥|<=|~)\s*", "", str(size_str))
+        m = self._SIZE.search(s)
+        if not m:
+            return 0.0
+        unit = (m.group(2) or "").upper()
+        factor = self._UNIT_MB.get(unit)
+        try:
+            if factor is not None:
+                return self._parse_decimal(m.group(1), integral=False) * factor
+            return self._parse_decimal(m.group(1), integral=True) / 1_048_576     # bytes
+        except ValueError:
+            return 0.0
 
     def _parse_number(self, num_str: str) -> int:
         if not num_str:

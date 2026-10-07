@@ -7,6 +7,9 @@ metadata:
 data:
   # Core settings
   MAT_TIMEOUT: {{ .Values.config.matTimeout | quote }}
+  MAT_MAX_CONCURRENT: {{ .Values.config.matMaxConcurrent | quote }}
+  MAT_QUEUE_TIMEOUT_SECONDS: {{ .Values.config.matQueueTimeout | quote }}
+  MAT_XMX: {{ .Values.config.matXmx | quote }}
   UVICORN_WORKERS: {{ .Values.config.uvicornWorkers | quote }}
   LOG_LEVEL: {{ .Values.config.logLevel | quote }}
   LOG_JSON: {{ .Values.config.logJson | quote }}
@@ -18,6 +21,8 @@ data:
   SUSPECTS_SECONDARY_LEAK_HIGH_MB: {{ .Values.config.suspects.secondaryLeakHighMb | quote }}
   SUSPECTS_HEAP_LEAK_CRITICAL_PCT: {{ .Values.config.suspects.heapLeakCriticalPct | quote }}
   SUSPECTS_HEAP_LEAK_WARNING_PCT: {{ .Values.config.suspects.heapLeakWarningPct | quote }}
+  SUSPECTS_MIN_PROBLEM_MB: {{ .Values.config.suspects.minProblemMb | quote }}
+  SUSPECTS_MIN_PROBLEM_PCT: {{ .Values.config.suspects.minProblemPct | quote }}
   # Overview analyzer thresholds
   OVERVIEW_LARGE_HEAP_HIGH_MB: {{ .Values.config.overview.largeHeapHighMb | quote }}
   OVERVIEW_LARGE_HEAP_MEDIUM_MB: {{ .Values.config.overview.largeHeapMediumMb | quote }}

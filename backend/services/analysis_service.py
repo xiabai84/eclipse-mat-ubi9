@@ -1,16 +1,16 @@
-"""Analysis orchestration service.
+"""Analysis orchestration: upload → (decompress) → Eclipse MAT → the three analyzers → cleanup.
 
-Contains the logic for running individual analyzers, running all three
-analyzers, and the full heapdump upload-to-analysis pipeline.
+Every request works in its own directory below HEAPDUMPS_DIR. The directory - uploaded dump, MAT index files,
+report ZIPs, extracted HTML - is removed when the request ends, also when it fails.
 """
 
 import asyncio
+import gzip
 import logging
 import shutil
-import tempfile
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from fastapi import HTTPException, UploadFile, status
 
@@ -20,76 +20,32 @@ from analyzers import (
     MATTopComponentsAnalyzer,
 )
 from config import get_settings
-from models import AnalyzeRequest
-from services.mat_runner import find_report, run_mat
+from services.mat_runner import MatBusy, find_report, mat_slot, run_mat
 
 logger = logging.getLogger("mat-service")
 
-
-def resolve_output(output_dir: Optional[str], prefix: str) -> str:
-    """Resolve or create an output directory for analyzer results."""
-    if output_dir:
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
-        return output_dir
-    return tempfile.mkdtemp(prefix=f"mat_{prefix}_")
-
-
-def run_analyzer(analyzer_cls, request: AnalyzeRequest) -> Dict[str, Any]:
-    """Run a single analyzer class and return structured result dict."""
-    report_path = Path(request.report_path)
-    if not report_path.exists():
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Report not found: {request.report_path}",
-        )
-    out_dir = resolve_output(request.output_dir, analyzer_cls.__name__)
-    try:
-        analyzer = analyzer_cls(str(report_path), out_dir)
-        analyzer.analyze()
-        result: Dict[str, Any] = {
-            "status": "ok",
-            "report_path": str(report_path),
-            "output_dir": out_dir,
-            "analysis": analyzer.report_data,
-            "problems_found": len(analyzer.report_data.get("problems", [])),
-        }
-        if request.include_text:
-            result["report_text"] = analyzer.generate_report()
-        return result
-    except Exception as exc:
-        logger.exception("Analysis failed for %s", request.report_path)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Analysis failed: {exc}",
-        )
+ANALYZERS = {
+    "suspects": MATLeakSuspectsAnalyzer,
+    "overview": MATSystemOverviewAnalyzer,
+    "top_components": MATTopComponentsAnalyzer,
+}
+CHUNK = 1024 * 1024
 
 
-def run_all_analyzers(
-    reports_dir: Path,
-    output_dir: Optional[str],
-    include_text: bool,
-) -> Dict[str, Any]:
-    """Run all three analysers on *reports_dir* and merge results."""
-    specs = [
-        ("suspects",       MATLeakSuspectsAnalyzer,  ["Leak_Suspects", "Suspects", "leak"]),
-        ("overview",       MATSystemOverviewAnalyzer, ["System_Overview", "Overview", "overview"]),
-        ("top_components", MATTopComponentsAnalyzer,  ["Top_Components", "top_component"]),
-    ]
-    result: Dict[str, Any] = {
-        "suspects": None, "overview": None, "top_components": None, "total_problems": 0,
-    }
-    for key, cls, patterns in specs:
-        report_zip = find_report(reports_dir, patterns)
+def run_all_analyzers(work_dir: Path, include_text: bool = True) -> Dict[str, Any]:
+    """Run the three analyzers on the report ZIPs in ``work_dir``."""
+    result: Dict[str, Any] = {key: None for key in ANALYZERS}
+    result["total_problems"] = 0
+    for key, cls in ANALYZERS.items():
+        report_zip = find_report(work_dir, key)
         if report_zip is None:
-            result[key] = {"status": "skipped", "reason": "No matching ZIP found"}
+            result[key] = {"status": "skipped", "reason": "MAT produced no report of this kind"}
             continue
-        out = resolve_output(output_dir, key)
         try:
-            analyzer = cls(str(report_zip), out)
+            analyzer = cls(str(report_zip), str(work_dir / f"extracted_{key}"))
             analyzer.analyze()
             entry: Dict[str, Any] = {
                 "status": "ok",
-                "report_path": str(report_zip),
                 "problems_found": len(analyzer.report_data.get("problems", [])),
                 "analysis": analyzer.report_data,
             }
@@ -98,117 +54,83 @@ def run_all_analyzers(
             result[key] = entry
             result["total_problems"] += entry["problems_found"]
         except Exception as exc:
-            logger.exception("Analysis failed for %s (%s)", report_zip, key)
-            result[key] = {
-                "status": "error",
-                "report_path": str(report_zip),
-                "error": str(exc),
-            }
+            logger.exception("Analyzer %s failed", key)
+            result[key] = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
     return result
 
 
-async def heapdump_pipeline(
-    file: UploadFile,
-    heapdumps_dir: str,
-    reports_dir: str,
-) -> tuple:
+def _decompress(src: Path, dest: Path, limit: int) -> None:
+    """gunzip src → dest, refusing to write more than ``limit`` bytes (decompression bomb)."""
+    written = 0
+    with gzip.open(src, "rb") as fin, dest.open("wb") as fout:
+        while True:
+            chunk = fin.read(CHUNK)
+            if not chunk:
+                break
+            written += len(chunk)
+            if written > limit:
+                raise ValueError(f"decompressed dump exceeds {limit / 1024 ** 3:.0f} GB (MAX_DUMP_SIZE_BYTES)")
+            fout.write(chunk)
+
+
+def _mat_locked(dump: Path) -> Dict[str, Any]:
+    with mat_slot():
+        return run_mat(dump)
+
+
+async def heapdump_pipeline(file: UploadFile, include_text: bool = True) -> tuple:
     """
-    Shared coroutine for the /analyze/heapdump* endpoints.
-
-    Saves the uploaded .hprof, runs Eclipse MAT, runs all three Python
-    analysers, cleans up generated ZIPs, and returns:
-
-        (filename, size_mb, dest_path, mat_result, analysis_dict)
-
-    Raises HTTPException on any fatal error.
+    Save the uploaded .hprof / .hprof.gz, run MAT and the analyzers, and return
+    ``(filename, size_mb, mat_result, analysis)``. Raises HTTPException on failure.
     """
     settings = get_settings()
-    filename = file.filename or "dump.hprof"
-    if not filename.lower().endswith(".hprof"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only .hprof heap dump files are accepted.",
-        )
+    filename = Path(file.filename or "dump.hprof").name        # never a path from the client
+    lower = filename.lower()
+    if not (lower.endswith(".hprof") or lower.endswith(".hprof.gz")):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Only .hprof and .hprof.gz heap dumps are accepted.")
 
-    # ── Save upload in 1 MB chunks ────────────────────────────────────────────
-    hd_dir = Path(heapdumps_dir)
-    hd_dir.mkdir(parents=True, exist_ok=True)
-    unique_prefix = uuid.uuid4().hex[:12]
-    dest = hd_dir / f"{unique_prefix}_{filename}"
-
-    logger.info("Saving uploaded heap dump → %s", dest)
-    total_bytes = 0
+    work = Path(settings.heapdumps_dir) / f"job-{uuid.uuid4().hex}"
+    work.mkdir(parents=True)
+    loop = asyncio.get_running_loop()
     try:
-        with dest.open("wb") as fh:
-            while True:
-                chunk = await file.read(1024 * 1024)
-                if not chunk:
-                    break
-                total_bytes += len(chunk)
-                if total_bytes > settings.max_upload_size_bytes:
+        # ── save the upload in 1 MB chunks ───────────────────────────────────
+        upload = work / ("upload.hprof.gz" if lower.endswith(".gz") else "heap.hprof")
+        total = 0
+        with upload.open("wb") as fh:
+            while chunk := await file.read(CHUNK):
+                total += len(chunk)
+                if total > settings.max_upload_size_bytes:
                     raise HTTPException(
-                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                        detail=(
-                            f"Upload exceeds maximum size of "
-                            f"{settings.max_upload_size_bytes / (1024**3):.0f} GB"
-                        ),
-                    )
-                fh.write(chunk)
-    except HTTPException:
-        # Clean up partial file on size limit
-        dest.unlink(missing_ok=True)
-        raise
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to save upload: {exc}",
-        )
-    finally:
+                        status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        f"Upload exceeds {settings.max_upload_size_bytes / 1024 ** 3:.0f} GB (MAX_UPLOAD_SIZE_BYTES)")
+                await loop.run_in_executor(None, fh.write, chunk)
         await file.close()
+        size_mb = round(total / 1_048_576, 2)
+        logger.info("Saved %s (%.1f MB) in %s", filename, size_mb, work.name)
 
-    size_mb = round(dest.stat().st_size / 1_048_576, 2)
-    logger.info("Saved %s (%.1f MB)", dest, size_mb)
+        dump = work / "heap.hprof"
+        if upload != dump:
+            try:
+                await loop.run_in_executor(None, _decompress, upload, dump, settings.max_dump_size_bytes)
+            except (OSError, EOFError, ValueError) as exc:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Cannot decompress {filename}: {exc}")
+            upload.unlink()
 
-    rpt_dir = Path(reports_dir)
-
-    # ── Run Eclipse MAT (CPU-bound → thread pool) ─────────────────────────────
-    loop = asyncio.get_event_loop()
-    logger.info("Running Eclipse MAT…")
-    mat_result = await loop.run_in_executor(None, run_mat, dest, rpt_dir)
-
-    if mat_result["status"] == "error":
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"MAT execution failed: {mat_result['error']}",
-        )
-
-    # ── Run Python analysers (CPU-bound → thread pool) ────────────────────────
-    analyzer_tmp = tempfile.mkdtemp(prefix="mat_analysis_")
-    logger.info("Running Python analysers on %s…", rpt_dir)
-    analysis = await loop.run_in_executor(
-        None, run_all_analyzers, rpt_dir, analyzer_tmp, True   # always generate text
-    )
-
-    # ── Delete temporary ZIPs (keep /reports clean) ───────────────────────────
-    for zip_path in mat_result.get("reports_generated", []):
+        # ── Eclipse MAT (waits for a free slot) ──────────────────────────────
         try:
-            Path(zip_path).unlink(missing_ok=True)
-            logger.info("Deleted temporary MAT report: %s", zip_path)
-        except Exception as exc:
-            logger.warning("Could not delete %s: %s", zip_path, exc)
+            mat_result = await loop.run_in_executor(None, _mat_locked, dump)
+        except MatBusy as exc:
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, f"MAT is busy: {exc}", headers={"Retry-After": "300"})
+        if mat_result["status"] != "ok":
+            detail = mat_result["error"]
+            if mat_result.get("output_tail"):
+                detail += "\n" + mat_result["output_tail"]
+            code = status.HTTP_504_GATEWAY_TIMEOUT if "timed out" in detail else status.HTTP_502_BAD_GATEWAY
+            raise HTTPException(code, detail)
 
-    # ── Delete uploaded .hprof — analysis is complete, no longer needed ──────
-    try:
-        dest.unlink(missing_ok=True)
-        logger.info("Deleted uploaded heap dump: %s", dest)
-    except Exception as exc:
-        logger.warning("Could not delete %s: %s", dest, exc)
-
-    # ── Delete analyzer temp directory (extracted HTML, etc.) ────────────────
-    try:
-        shutil.rmtree(analyzer_tmp, ignore_errors=True)
-        logger.info("Deleted analyzer temp dir: %s", analyzer_tmp)
-    except Exception as exc:
-        logger.warning("Could not delete %s: %s", analyzer_tmp, exc)
-
-    return filename, size_mb, dest, mat_result, analysis
+        # ── analyzers ─────────────────────────────────────────────────────────
+        analysis = await loop.run_in_executor(None, run_all_analyzers, work, include_text)
+        return filename, size_mb, mat_result, analysis
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+        logger.info("Removed work directory %s", work.name)

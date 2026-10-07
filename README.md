@@ -45,11 +45,15 @@ docker build --platform linux/amd64 -f docker/Dockerfile -t eclipse-mat .
 docker run -d \
   --name mat-service \
   --platform linux/amd64 \
+  --memory=16g \
   -p 8080:8080 \
+  -e API_TOKEN=change-me \
   -v $(pwd)/heapdumps:/heapdumps \
-  -v $(pwd)/reports:/reports \
   eclipse-mat
 ```
+
+`API_TOKEN` is optional: without it the analysis endpoints are open to anyone who can reach the service (a warning is
+logged). MAT's heap is derived from the memory limit (75 %), see [Configuration](#configuration).
 
 ### 3. Verify
 
@@ -61,10 +65,9 @@ curl http://localhost:8080/health
 {
   "status": "ok",
   "service": "mat-analysis",
-  "version": "3.1.0",
+  "version": "4.0.0",
   "mat_available": true,
   "disk": {
-    "reports": { "free_gb": 42.5, "total_gb": 100.0 },
     "heapdumps": { "free_gb": 42.5, "total_gb": 100.0 }
   }
 }
@@ -75,13 +78,15 @@ Browse the interactive API docs at **http://localhost:8080/docs**.
 ### 4. Analyse a heap dump
 
 ```bash
-# Human-readable report
+# Human-readable report (.hprof or .hprof.gz)
 curl -s -X POST http://localhost:8080/analyze/heapdump/report \
-     -F "file=@./heapdumps/myapp.hprof"
+     -H "Authorization: Bearer $API_TOKEN" \
+     -F "file=@./heapdumps/myapp.hprof.gz"
 
 # Structured JSON response
 curl -s -X POST http://localhost:8080/analyze/heapdump \
-     -F "file=@./heapdumps/myapp.hprof" | python3 -m json.tool
+     -H "Authorization: Bearer $API_TOKEN" \
+     -F "file=@./heapdumps/myapp.hprof.gz" | python3 -m json.tool
 ```
 
 ### 5. (Optional) Generate demo heap dumps
@@ -112,31 +117,31 @@ chmod +x demo/run-demo.sh
 │  │          ▼               │    • parses with BS4/lxml    │     │
 │  │  Leak_Suspects.zip       │    • returns JSON / text     │     │
 │  │  System_Overview.zip     │                              │     │
-│  │  Top_Components.zip  ───►│  POST /analyze/all           │     │
-│  └─────────────────────┘    │    • scans reports dir       │     │
-│                             │    • runs all analyzers      │     │
-│  ┌──────────────────────┐   └──────────────────────────────┘     │
-│  │  Python Analyzers    │                                        │
-│  │  suspects.py         │   Volume mounts                        │
-│  │  overview.py         │   /heapdumps  ← .hprof uploads         │
-│  │  top_components.py   │   /reports    ← ZIP report output      │
+│  │  Top_Components.zip  ───►│  POST /analyze/heapdump/report│    │
+│  └─────────────────────┘    │    • same, as plain text     │     │
+│                             └──────────────────────────────┘     │
+│  ┌──────────────────────┐                                        │
+│  │  Python Analyzers    │   Volume mount                         │
+│  │  suspects.py         │   /heapdumps/job-<id>/  one directory  │
+│  │  overview.py         │     per request: dump, MAT index and   │
+│  │  top_components.py   │     report ZIPs - removed afterwards   │
 │  └──────────────────────┘                                        │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
 **Data flow:**
 ```
-Upload .hprof → Save to /heapdumps → Run MAT (subprocess) → Generate ZIPs in /reports
-  → Parse ZIPs with BeautifulSoup → Extract tables/data → Build report → Return JSON or text
+Upload .hprof(.gz) → /heapdumps/job-<id>/ (decompress) → wait for a MAT slot → run MAT → report ZIPs next
+  to the dump → parse with BeautifulSoup → JSON or text → remove /heapdumps/job-<id>/ (also on failure)
 ```
-
-Three analysis workflows are supported:
 
 | Workflow | Endpoint | Response |
 |----------|----------|----------|
 | Upload & analyse (human-readable) | `POST /analyze/heapdump/report` | `text/plain` |
 | Upload & analyse (machine-readable) | `POST /analyze/heapdump` | JSON |
-| Analyse pre-generated ZIP reports | `POST /analyze/all` | JSON |
+
+Concurrent requests never share files. At most `MAT_MAX_CONCURRENT` MAT runs happen at the same time across all
+worker processes; the others wait up to `MAT_QUEUE_TIMEOUT_SECONDS`, then get `503`.
 
 ---
 
@@ -200,13 +205,16 @@ Python packages installed via `pip` into `/opt/venv`:
 
 | Package | Version | Purpose |
 |---------|---------|---------|
-| `fastapi` | >= 0.111.0 | REST API framework |
-| `uvicorn[standard]` | >= 0.29.0 | ASGI server (with uvloop, httptools, watchfiles) |
-| `pydantic` | >= 2.0.0 | Request/response data validation |
-| `pydantic-settings` | >= 2.0.0 | Environment-variable-based configuration |
-| `beautifulsoup4` | >= 4.12.0 | HTML parsing for MAT report extraction |
-| `lxml` | >= 5.0.0 | Fast HTML parser backend for BeautifulSoup |
-| `python-multipart` | >= 0.0.9 | Required by FastAPI for file uploads |
+| `fastapi` | 0.128.8 | REST API framework |
+| `uvicorn[standard]` | 0.39.0 | ASGI server (with uvloop, httptools, watchfiles) |
+| `pydantic` | 2.13.5 | Request/response data validation |
+| `pydantic-settings` | 2.11.0 | Environment-variable-based configuration |
+| `beautifulsoup4` | 4.15.0 | HTML parsing for MAT report extraction |
+| `lxml` | 6.1.3 | Fast HTML parser backend for BeautifulSoup |
+| `python-multipart` | 0.0.20 | Required by FastAPI for file uploads |
+
+Versions are pinned exactly (tested with Python 3.9 as in UBI 9); the MAT download is checked against Eclipse's
+SHA-512 (`MAT_SHA512` build arg).
 
 #### Stage 3 — `runtime` (final image)
 
@@ -237,27 +245,26 @@ Artefacts copied from builder stages:
 
 | Property | Value |
 |----------|-------|
-| Base image | `registry.access.redhat.com/ubi9/ubi-minimal:latest` |
+| Base image | `registry.access.redhat.com/ubi9/ubi-minimal:9.8` (build arg `UBI_TAG`) |
 | Final image size | ~594 MB |
 | Java | OpenJDK 17 (headless) |
 | Python | 3.9 (RHEL 9 system Python) |
 | Eclipse MAT | 1.16.1 |
 | Runtime user | `mat` (UID 1001, non-root) |
 | Exposed port | 8080 |
-| Volumes | `/heapdumps`, `/reports` |
+| Volumes | `/heapdumps` |
 
 ### Container Paths
 
 | Path | Description |
 |------|-------------|
 | `/opt/eclipse-mat/ParseHeapDump.sh` | MAT executable |
-| `/opt/eclipse-mat/MemoryAnalyzer.ini` | MAT JVM configuration (`-Xmx32g -Xms4g`) |
+| `/opt/eclipse-mat/MemoryAnalyzer.ini` | MAT's own JVM configuration (`-Xmx1024m`) – **not used for the heap**: the service passes `-vmargs` with `MAT_XMX`, which replaces it |
 | `/opt/mat-service/` | Python backend code |
 | `/opt/venv/` | Python virtual environment |
 | `/usr/lib/jvm/jre-17-openjdk` | Java 17 JRE home |
 | `/usr/local/bin/entrypoint.sh` | Container entrypoint |
-| `/heapdumps` | Upload directory for `.hprof` files (volume mount) |
-| `/reports` | Output directory for MAT ZIP reports (volume mount) |
+| `/heapdumps` | One work directory per request (dump, MAT index files, report ZIPs), removed afterwards (volume mount) |
 
 ### Why Not `ubi9-micro`?
 
@@ -312,43 +319,53 @@ paths. The trade-off strongly favours `ubi9-minimal`.
 
 | Method | Path | Response | Description |
 |--------|------|----------|-------------|
-| `GET` | `/health` | JSON | Liveness probe |
-| `GET` | `/reports` | JSON | List ZIP reports in `/reports`, grouped by type |
-| `POST` | `/analyze/heapdump/report` | `text/plain` | Upload `.hprof` → run MAT → human-readable report |
-| `POST` | `/analyze/heapdump` | JSON | Upload `.hprof` → run MAT → structured analysis |
-| `POST` | `/analyze/suspects` | JSON | Analyse an existing Leak Suspects ZIP |
-| `POST` | `/analyze/overview` | JSON | Analyse an existing System Overview ZIP |
-| `POST` | `/analyze/top-components` | JSON | Analyse an existing Top Components ZIP |
-| `POST` | `/analyze/all` | JSON | Auto-discover and run all three analyzers |
+| `GET` | `/health` | JSON | Liveness probe (never requires the token) |
+| `POST` | `/analyze/heapdump/report` | `text/plain` | Upload `.hprof` / `.hprof.gz` → run MAT → human-readable report |
+| `POST` | `/analyze/heapdump` | JSON | Upload `.hprof` / `.hprof.gz` → run MAT → structured analysis |
 | `GET` | `/docs` | HTML | Swagger UI |
 
-### `/analyze/heapdump/report` — form fields
+With `API_TOKEN` set, both `POST` endpoints require `Authorization: Bearer <API_TOKEN>` (`401` otherwise).
+
+### Form fields
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `file` *(required)* | -- | `.hprof` heap dump file |
-| `sections` | `suspects,overview,top_components` | Comma-separated subset to include |
-| `heapdumps_dir` | `/heapdumps` | Container path where the upload is saved |
-| `reports_dir` | `/reports` | Container path for MAT ZIP output |
+| `file` *(required)* | -- | `.hprof` or `.hprof.gz` heap dump |
+| `sections` *(report only)* | `suspects,overview,top_components` | Comma-separated subset to include |
 
 ```bash
 # Only the Leak Suspects section
 curl -s -X POST http://localhost:8080/analyze/heapdump/report \
-     -F "file=@./heapdumps/myapp.hprof" \
+     -H "Authorization: Bearer $API_TOKEN" \
+     -F "file=@./heapdumps/myapp.hprof.gz" \
      -F "sections=suspects"
 ```
 
-### `/analyze/all` — JSON body
+### Errors
 
-```json
-{ "reports_dir": "/reports", "output_dir": null, "include_text": true }
-```
+| Status | Meaning |
+|--------|---------|
+| `400` | not a `.hprof` / `.hprof.gz`, or the `.gz` cannot be decompressed |
+| `401` | `API_TOKEN` set and the bearer token missing or wrong |
+| `413` | larger than `MAX_UPLOAD_SIZE_BYTES` (checked from `Content-Length` before the upload is read) or, decompressed, than `MAX_DUMP_SIZE_BYTES` |
+| `502` | MAT failed or produced no report (e.g. out of memory: raise `MAT_XMX` / the memory limit) – never a stale report |
+| `503` | no MAT slot free within `MAT_QUEUE_TIMEOUT_SECONDS` (`Retry-After` header) |
+| `504` | MAT exceeded `MAT_TIMEOUT`; the MAT process is killed |
 
-### `/analyze/suspects` (and `/overview`, `/top-components`) — JSON body
+### What the analysis reports
 
-```json
-{ "report_path": "/reports/myapp_Leak_Suspects.zip", "output_dir": null, "include_text": true }
-```
+- **Leak suspects** with the *accumulation point* and the field path that keeps it alive, e.g.
+  `JavaMemoryIssuesDemo.STATIC_SESSIONS (static) → java.util.ArrayList.elementData → java.lang.Object[]`, and the
+  thread when MAT names one (`worker-tl (keeps local variables of 60.0 MB)`). Suspects below `SUSPECTS_MIN_PROBLEM_MB`
+  or `SUSPECTS_MIN_PROBLEM_PCT` are listed but are no problems – MAT names suspects on every heap.
+- **System overview**: heap, objects, classes, GC roots (object and GC-root counts are warnings, not problems),
+  class histogram, threads that retain much memory.
+- **Top components**: memory per class loader, the biggest objects, and MAT's own verdicts of its waste checks.
+  Empty collections, duplicate content and the like count as waste; collections with low fill ratios are reported
+  as warnings with the memory they *retain* (that is not waste and often overlaps with empty collections).
+
+The results contain class and field names, thread names and object addresses, but not the contents of strings
+(MAT's report pages do show them).
 
 ---
 
@@ -445,165 +462,113 @@ ls ./heapdumps/*.hprof | parallel -j4 \
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MAT_TIMEOUT` | `600` | Seconds before MAT subprocess is killed |
-| `UVICORN_WORKERS` | `4` | Number of uvicorn worker processes |
-| `MAX_UPLOAD_SIZE_BYTES` | `21474836480` | Upload file size limit in bytes (20 GB); returns HTTP 413 if exceeded |
+| `API_TOKEN` | *(empty)* | When set, the analysis endpoints require `Authorization: Bearer <API_TOKEN>`. Empty: open, with a warning in the log |
+| `MAT_XMX` | *(empty)* | MAT's JVM heap, e.g. `12g`. Empty: 75 % of the container memory limit divided by `MAT_MAX_CONCURRENT` (fallback `4g` without a limit) |
+| `MAT_MAX_CONCURRENT` | `1` | MAT runs at the same time, across all worker processes |
+| `MAT_QUEUE_TIMEOUT_SECONDS` | `3600` | How long a request waits for a free MAT slot before `503` |
+| `MAT_TIMEOUT` | `3600` | Seconds one MAT run may take; then MAT is killed (`504`) |
+| `MAX_UPLOAD_SIZE_BYTES` | `21474836480` | Upload limit (20 GB; the compressed size for `.hprof.gz`) |
+| `MAX_DUMP_SIZE_BYTES` | `68719476736` | Limit after decompressing a `.hprof.gz` (64 GB) |
+| `HEAPDUMPS_DIR` | `/heapdumps` | Work directories (one per request) |
+| `UVICORN_WORKERS` | `4` | uvicorn worker processes (they share the MAT slots) |
 | `LOG_LEVEL` | `INFO` | Root log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
-| `LOG_JSON` | `false` | Set to `true` for JSON-structured logging (one object per line, for ELK/CloudWatch) |
+| `LOG_JSON` | `false` | `true` for JSON-structured logging (one object per line) |
 
 #### Analyzer thresholds
 
-All analyzer thresholds are configurable via environment variables. Defaults match
-the original hardcoded values. Prefix determines the analyzer:
+All analyzer thresholds are configurable via environment variables; the prefix selects the analyzer:
 
 | Prefix | Analyzer | Example variable |
 |--------|----------|------------------|
-| `SUSPECTS_` | Leak Suspects | `SUSPECTS_PRIMARY_LEAK_HIGH_MB=500` |
+| `SUSPECTS_` | Leak Suspects | `SUSPECTS_MIN_PROBLEM_MB=10`, `SUSPECTS_MIN_PROBLEM_PCT=10` |
 | `OVERVIEW_` | System Overview | `OVERVIEW_LARGE_HEAP_HIGH_MB=2048` |
 | `TOP_COMPONENTS_` | Top Components | `TOP_COMPONENTS_DOMINANT_CONSUMER_MB=500` |
 
 See `backend/config.py` for the full list of threshold settings and their defaults.
 
+### MAT JVM memory
+
+MAT needs roughly 1.5–2× the dump size as heap. The service starts MAT with
+`-vmargs --add-exports=… -Xmx<MAT_XMX> -Duser.language=en -Duser.country=US`; on the command line, `-vmargs` replaces
+the options in `MemoryAnalyzer.ini` (whose `-Xmx1024m` would otherwise apply), so do not mount a custom ini – set
+the container memory limit, or `MAT_XMX`. The English locale keeps MAT's number format stable (the analyzers read
+both formats). A run that fails with `OutOfMemoryError` returns `502` with a hint to raise the memory.
+
 ```bash
-docker run -d \
-  -e MAT_TIMEOUT=3600 \
-  -e UVICORN_WORKERS=8 \
-  --platform linux/amd64 \
+docker run -d --platform linux/amd64 \
+  --memory 32g \
+  -e MAT_MAX_CONCURRENT=1 \
   -p 8080:8080 \
   -v $(pwd)/heapdumps:/heapdumps \
-  -v $(pwd)/reports:/reports \
-  eclipse-mat
+  eclipse-mat                         # MAT heap: 75 % of 32 GB = 24 GB
 ```
 
-### MAT JVM memory (large heap dumps)
+### Production sizing
 
-MAT is pre-configured with `-Xmx32g -Xms4g`. For dumps larger than ~16 GB,
-mount a custom `MemoryAnalyzer.ini`:
+Requests wait synchronously until their analysis is done. Sizing follows the **dump size** and
+`MAT_MAX_CONCURRENT`:
 
-```bash
-cat > MemoryAnalyzer.ini <<'EOF'
--vmargs
--Xmx64g
--Xms8g
--XX:+UseG1GC
--XX:+UseStringDeduplication
--XX:+ParallelRefProcEnabled
--Djava.io.tmpdir=/mat-work
-EOF
+| Heap dump size | RAM limit per parallel MAT run | Disk in `/heapdumps` per run | `MAT_TIMEOUT` |
+|----------------|--------------------------------|------------------------------|---------------|
+| < 1 GB | 4 GB | 3 GB | `600` |
+| 1–5 GB | 16 GB | 15 GB | `1800` |
+| 5–16 GB | 48 GB | 50 GB | `3600` |
 
-docker run -d --platform linux/amd64 \
-  -v $(pwd)/MemoryAnalyzer.ini:/opt/eclipse-mat/MemoryAnalyzer.ini \
-  -p 8080:8080 \
-  eclipse-mat
-```
+- **Memory:** container limit ≈ `MAT_MAX_CONCURRENT × (dump size × 2) / 0.75`. Keep `MAT_MAX_CONCURRENT=1` unless
+  the limit allows more; requests beyond it queue.
+- **Disk:** each run needs the dump, MAT's index files (~1–1.5× the dump) and the reports – and a `.hprof.gz`
+  upload is decompressed first. Uploads are also buffered in `/tmp` before they reach `/heapdumps`.
+- **Timeouts in front of the service** (ingress, router, load balancer) must exceed upload time +
+  `MAT_QUEUE_TIMEOUT_SECONDS` + `MAT_TIMEOUT`, or clients see a gateway timeout while MAT keeps working.
 
-### Production Deployment (20 Concurrent Users)
+#### Scaling out
 
-The service runs multiple uvicorn worker processes, each offloading CPU-bound
-MAT and analyzer work to a thread pool. Sizing depends primarily on **heap dump
-size** — MAT requires approximately 2x the dump size in RAM per analysis.
-
-#### Hardware Recommendations
-
-| Heap Dump Size | CPU | RAM | Disk | `UVICORN_WORKERS` | `MAT_TIMEOUT` |
-|----------------|-----|-----|------|-------------------|---------------|
-| Small (< 1 GB) | 8 cores | 32 GB | 100 GB SSD | `8` | `300` |
-| Medium (1–5 GB) | 16 cores | 128 GB | 500 GB SSD | `8` | `600` |
-| Large (5–16 GB) | 32 cores | 256 GB | 1 TB NVMe | `8` | `1800` |
-
-**Why these numbers:** With 20 concurrent users and 8 workers, up to 8 MAT
-analyses can run in parallel. Each analysis spawns a MAT subprocess that needs
-~2x the dump size in RAM. The remaining 12 requests queue and are served as
-workers become available. Python analyzers (parsing ZIPs) are lightweight and
-do not bottleneck.
-
-#### Recommended production `docker run`
-
-```bash
-docker run -d \
-  --name mat-service \
-  --platform linux/amd64 \
-  --cpus 16 \
-  --memory 128g \
-  -p 8080:8080 \
-  -e UVICORN_WORKERS=8 \
-  -e MAT_TIMEOUT=1200 \
-  -v /data/heapdumps:/heapdumps \
-  -v /data/reports:/reports \
-  eclipse-mat
-```
-
-#### Sizing Guidelines
-
-- **CPU:** Allocate 2 cores per uvicorn worker. With `UVICORN_WORKERS=8`, use
-  at least 16 cores so MAT subprocesses and Python analyzers do not starve each
-  other.
-- **RAM:** The dominant consumer is MAT. Each concurrent MAT analysis needs
-  ~2x the dump size. For 8 parallel analyses of 5 GB dumps:
-  `8 × 10 GB = 80 GB` plus OS + Python overhead → **128 GB** recommended.
-  Adjust `MemoryAnalyzer.ini` `-Xmx` to match.
-- **Disk:** Each upload is saved to `/heapdumps` and MAT generates temporary
-  index files (~1.5x dump size) plus ZIP reports. Use fast SSD/NVMe to avoid
-  I/O bottlenecks. Provision at least `3 × max_dump_size × UVICORN_WORKERS`.
-- **Workers:** Do not set `UVICORN_WORKERS` higher than the number of available
-  CPU cores. 8 workers handles 20 concurrent users well — requests beyond the
-  worker count queue briefly. For ZIP-only analysis endpoints (no MAT), workers
-  are freed quickly.
-- **Timeout:** Set `MAT_TIMEOUT` to at least `3 × expected_analysis_seconds`.
-  A 5 GB dump typically takes 3–8 minutes; set `MAT_TIMEOUT=1200` (20 min) to
-  cover worst-case I/O contention under load.
-
-#### Scaling Beyond 20 Users
-
-For higher concurrency, run multiple containers behind a load balancer (nginx,
-HAProxy, or Kubernetes Service). Each container instance handles its own set of
-workers. Shared storage (NFS, EFS) for `/heapdumps` and `/reports` is required
-in multi-instance deployments. Upload filenames are UUID-prefixed to prevent
-collisions across instances.
+Several instances behind a load balancer each have their own MAT slots; `/heapdumps` does not need to be shared
+(every request lives in its own directory on the instance that received it).
 
 ---
 
 ## Deploy on OpenShift (Helm)
 
-A Helm chart is provided at `helm/eclipse-mat-service/` for deploying on OpenShift.
+A Helm chart is provided at `helm/` for deploying on OpenShift. The image tag defaults to the chart's `appVersion`.
 
 ```bash
-# Install
-helm install mat-service helm/eclipse-mat-service/ \
+# Install, with a token from an existing Secret (key "api-token")
+oc create secret generic mat-api-token --from-literal=api-token="$(openssl rand -hex 24)"
+helm install mat-service helm/ \
   --set image.repository=your-registry.io/eclipse-mat \
-  --set image.tag=latest
+  --set auth.existingSecret=mat-api-token
 
 # Custom values file
-helm install mat-service helm/eclipse-mat-service/ -f my-values.yaml
+helm install mat-service helm/ -f my-values.yaml
 
 # Upgrade
-helm upgrade mat-service helm/eclipse-mat-service/
+helm upgrade mat-service helm/
 
 # Uninstall
 helm uninstall mat-service
 ```
 
-The chart creates: Deployment, Service (ClusterIP), OpenShift Route (TLS edge),
-two PVCs (`/heapdumps` 50Gi, `/reports` 10Gi), ConfigMap (all env vars), and
-ServiceAccount. All values are configurable — see `helm/eclipse-mat-service/values.yaml`.
+The chart creates: Deployment, Service (ClusterIP), OpenShift Route (TLS edge, 2 h timeouts – the request waits for
+the analysis), a PVC for `/heapdumps` (50Gi), ConfigMap (all env vars), ServiceAccount, and – with `auth.apiToken` –
+a Secret. `/tmp` is an emptyDir with `persistence.tmpSizeLimit` (uploads are buffered there). All values are
+configurable – see `helm/values.yaml`.
 
 Key overrides:
 
 ```bash
 # Large production instance
-helm install mat-service helm/eclipse-mat-service/ \
+helm install mat-service helm/ \
   --set resources.requests.memory=8Gi \
   --set resources.limits.memory=40Gi \
   --set persistence.heapdumps.size=200Gi \
-  --set config.matTimeout=3600
+  --set config.matTimeout=3600                 # MAT heap: 75 % of 40Gi = 30 GB
 
 # Disable Route (internal-only)
-helm install mat-service helm/eclipse-mat-service/ --set route.enabled=false
+helm install mat-service helm/ --set route.enabled=false
 
 # Disable persistent storage (ephemeral)
-helm install mat-service helm/eclipse-mat-service/ \
-  --set persistence.heapdumps.enabled=false \
-  --set persistence.reports.enabled=false
+helm install mat-service helm/ --set persistence.heapdumps.enabled=false
 ```
 
 ---
@@ -616,8 +581,19 @@ pip install -r requirements-test.txt
 python -m pytest tests/ -v
 ```
 
-Tests use in-memory synthetic ZIP fixtures — no heap dumps or Eclipse MAT
-installation required.
+The analyzer tests run against **real Eclipse MAT 1.16.1 reports** in `tests/fixtures/mat/` (HTML text, zipped at
+test time), made by `tests/fixtures/make_fixtures.py` from three heap dumps with known content (demo scenario 1, a
+healthy 2 MB heap, and `tests/integration/GroundTruth.java`); local paths, user and host names are scrubbed. The
+service tests use a stand-in for MAT. Neither needs MAT installed.
+
+With a real MAT (Linux), the integration test builds the ground-truth dump and runs it through the service:
+
+```bash
+MAT_SCRIPT=/opt/eclipse-mat/ParseHeapDump.sh python -m pytest tests/integration -v
+```
+
+CI (`.github/workflows/ci.yml`) runs the unit tests (Python 3.9 and 3.12), the integration test with the
+checksum-verified MAT, and builds the image and smoke-tests it with a memory limit and a token.
 
 ---
 
@@ -631,17 +607,17 @@ eclipse-mat-service/
 │   ├── app.py                          # App factory (~57 lines) — creates FastAPI instance
 │   ├── config.py                       # Pydantic BaseSettings: all config + analyzer thresholds
 │   ├── logging_config.py               # Structured JSON logging (LOG_JSON=true)
-│   ├── models.py                       # Pydantic request/response models
+│   ├── auth.py                         # Optional bearer token (API_TOKEN)
 │   ├── exceptions.py                   # Centralized exception handlers
 │   ├── main.py                         # Local dev entry point (uvicorn.run)
 │   ├── requirements.txt                # Python dependencies (production)
 │   ├── requirements-test.txt           # Test dependencies (pytest, httpx)
 │   ├── routes/
-│   │   ├── operations.py               # /health (with disk info), /reports
+│   │   ├── operations.py               # /health (with disk info)
 │   │   └── analysis.py                 # All /analyze/* routes
 │   ├── services/
-│   │   ├── mat_runner.py               # MAT subprocess execution
-│   │   └── analysis_service.py         # Analyzer orchestration + heapdump pipeline
+│   │   ├── mat_runner.py               # MAT run: slots, -vmargs, process-group timeout
+│   │   └── analysis_service.py         # Work dir per request → MAT → analyzers → cleanup
 │   ├── analyzers/
 │   │   ├── __init__.py                 # Exports three analyzer classes
 │   │   ├── base.py                     # MATBaseAnalyzer: ZIP extraction, HTML parsing
@@ -650,8 +626,12 @@ eclipse-mat-service/
 │   │   ├── top_components.py           # MATTopComponentsAnalyzer
 │   │   └── java_recommendations.json   # 16 diagnostic patterns (externalized)
 │   └── tests/
-│       ├── conftest.py                 # Shared fixtures (synthetic ZIPs, TestClient)
-│       ├── test_app.py                 # Route and helper tests
+│       ├── conftest.py                 # Real MAT fixtures (zipped at test time), fake MAT, TestClient
+│       ├── fixtures/                   # make_fixtures.py + mat/<fixture>_<report>/ (real MAT HTML, scrubbed)
+│       ├── integration/                # GroundTruth.java + test with a real MAT (MAT_SCRIPT)
+│       ├── test_app.py                 # Service: auth, uploads, MAT failures, timeouts, concurrency, cleanup
+│       ├── test_parsing.py             # Sizes and names as MAT prints them (both locales)
+│       ├── test_text_reports.py        # Text reports render for every fixture
 │       ├── test_suspects_analyzer.py   # Leak Suspects analyzer tests
 │       ├── test_overview_analyzer.py   # System Overview analyzer tests
 │       └── test_top_components_analyzer.py  # Top Components analyzer tests
@@ -678,11 +658,10 @@ eclipse-mat-service/
 │           ├── route.yaml              # OpenShift Route (TLS edge)
 │           ├── configmap.yaml          # All env vars from config.py
 │           ├── pvc-heapdumps.yaml      # PVC for /heapdumps (50Gi)
-│           ├── pvc-reports.yaml        # PVC for /reports (10Gi)
+│           ├── secret.yaml             # API token (only with auth.apiToken)
 │           └── serviceaccount.yaml     # ServiceAccount with pull secrets
 │
 ├── heapdumps/                          # Volume mount: .hprof files
-└── reports/                            # Volume mount: MAT ZIP reports
 ```
 
 ---
@@ -713,7 +692,7 @@ directories have restrictive host permissions, the container cannot write to
 them. Fix with:
 
 ```bash
-chmod 777 ./heapdumps ./reports
+chmod 777 ./heapdumps
 ```
 
 Or match the UID:

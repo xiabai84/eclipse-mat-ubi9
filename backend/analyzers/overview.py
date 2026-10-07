@@ -207,7 +207,7 @@ class MATSystemOverviewAnalyzer(MATBaseAnalyzer):
             cols = row.find_all(["td", "th"])
             if len(cols) < 4:
                 continue
-            class_name = self._clean_text(cols[0].get_text())
+            class_name = self._clean_name(cols[0].get_text(separator=" "))
             obj_count = self._parse_number(cols[1].get_text())
             shallow = cols[2].get_text(strip=True)
             retained = cols[3].get_text(strip=True)
@@ -266,7 +266,7 @@ class MATSystemOverviewAnalyzer(MATBaseAnalyzer):
                 # Biggest Objects: col[0]=class, col[1]=shallow, col[2]=retained
                 # Dominator classes: col[0]=label, col[1]=# objects, col[2]=used, col[3]=retained
                 name = self._short_classname(
-                    self._clean_text(cols[0].get_text(separator=" "))
+                    self._clean_name(cols[0].get_text(separator=" "))
                 )
                 # Prefer the last numeric column as the retained size
                 size = ""
@@ -332,13 +332,12 @@ class MATSystemOverviewAnalyzer(MATBaseAnalyzer):
 
         # Object count
         obj = s["total_objects"]
+        # Object count and GC roots describe every large heap; on their own they are no problem.
         if obj > thresholds.high_object_count:
-            problems.append(
+            warnings.append(
                 {
-                    "severity": "HIGH",
                     "type": "HIGH_OBJECT_COUNT",
                     "description": f"Very high object count: {obj:,}",
-                    "recommendation": "Investigate object creation patterns; consider pooling",
                 }
             )
         elif obj > thresholds.elevated_object_count:
@@ -373,12 +372,10 @@ class MATSystemOverviewAnalyzer(MATBaseAnalyzer):
         # GC roots
         gc = s["total_gc_roots"]
         if gc > thresholds.high_gc_root_count:
-            problems.append(
+            warnings.append(
                 {
-                    "severity": "MEDIUM",
                     "type": "HIGH_GC_ROOT_COUNT",
-                    "description": f"High GC root count: {gc:,} — may impact GC performance",
-                    "recommendation": "Investigate static references and long-lived objects",
+                    "description": f"High GC root count: {gc:,}",
                 }
             )
 

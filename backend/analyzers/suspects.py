@@ -63,6 +63,11 @@ def _size_label(s: dict) -> str:
     return ""
 
 
+# "The thread java.lang.Thread @ 0x7efafa660  worker-tl keeps local variables with total size 62,914,936 (31.04%) bytes"
+_THREAD_PAT = re.compile(
+    r"The thread \S+ @ 0x[0-9a-f]+\s+(.+?) keeps local variables with total size ([\d.,]+) \(", re.IGNORECASE)
+
+
 class MATLeakSuspectsAnalyzer(MATBaseAnalyzer):
     """Analyses Eclipse MAT Leak Suspects ZIP reports."""
 
@@ -90,11 +95,12 @@ class MATLeakSuspectsAnalyzer(MATBaseAnalyzer):
         if "index.html" in self.html_files:
             self._parse_index()
 
+        seen_pages = set()
         for filename, entry in self.html_files.items():
-            bare = Path(filename).name
-            is_numeric = re.fullmatch(r"\d+\.html", bare)
-            has_suspect = "Problem Suspect" in entry["content"]
-            if (is_numeric or has_suspect) and bare not in ("index.html", "toc.html"):
+            title = entry["soup"].title.get_text(strip=True) if entry["soup"].title else ""
+            # every page is registered twice (path and short name) - parse it once
+            if re.fullmatch(r"Problem Suspect \d+", title) and id(entry) not in seen_pages:
+                seen_pages.add(id(entry))
                 self._parse_suspect_page(filename)
 
         self._finalise_suspects()
@@ -205,9 +211,8 @@ class MATLeakSuspectsAnalyzer(MATBaseAnalyzer):
                     raw_bytes = _parse_occ_bytes(occ_m.group(1))
                     pct = _parse_occ_pct(occ_m.group(2))
                     s["heap_pct"] = pct
-                    if s["retained_mb"] == 0:
-                        s["retained_mb"] = raw_bytes / 1_048_576
-                        s["retained_raw"] = f"{raw_bytes / 1_048_576:.1f} MB"
+                    s["retained_mb"] = raw_bytes / 1_048_576      # exact; the pie-chart label is rounded
+                    s["retained_raw"] = f"{raw_bytes / 1_048_576:.1f} MB"
                 else:
                     # Fallback: percentage alone (also handle European comma decimal)
                     pct_m = re.search(r"\(([\d.,]+)\s*%\)", text)
@@ -253,6 +258,7 @@ class MATLeakSuspectsAnalyzer(MATBaseAnalyzer):
                 "classloader": None,
                 "stack": [],
                 "key_objects": [],
+                "accumulation_point": None,
             }
         return self._raw_suspects[suspect_id]
 
@@ -289,9 +295,8 @@ class MATLeakSuspectsAnalyzer(MATBaseAnalyzer):
             if occ_m:
                 raw_bytes = _parse_occ_bytes(occ_m.group(1))
                 suspect["heap_pct"] = _parse_occ_pct(occ_m.group(2))
-                if suspect["retained_mb"] == 0:
-                    suspect["retained_mb"] = raw_bytes / 1_048_576
-                    suspect["retained_raw"] = f"{raw_bytes / 1_048_576:.1f} MB"
+                suspect["retained_mb"] = raw_bytes / 1_048_576    # exact; the pie-chart label is rounded
+                suspect["retained_raw"] = f"{raw_bytes / 1_048_576:.1f} MB"
             elif not suspect["heap_pct"]:
                 pct_m = re.search(r"\(([\d.,]+)\s*%\)", suspect["description"])
                 if pct_m:
@@ -304,15 +309,13 @@ class MATLeakSuspectsAnalyzer(MATBaseAnalyzer):
                     break
 
         # ── Thread ──────────────────────────────────────────────────────────
+        # Only MAT's own statement counts. A thread that merely appears on the page (e.g. the GC root of the path)
+        # is not "the thread" of the suspect.
         if not suspect["thread"]:
-            for pat in (
-                r"(Thread[^@]*@\s*0x[0-9a-f]+[^\s<]*)",
-                r"thread\s+([^\n<]{5,80})",
-            ):
-                m = re.search(pat, content, re.IGNORECASE)
-                if m:
-                    suspect["thread"] = self._clean_text(m.group(1))
-                    break
+            m = _THREAD_PAT.search(self._clean_text(important.get_text(" ", strip=True)) if important else "")
+            if m:
+                kept_mb = _parse_occ_bytes(m.group(2)) / 1_048_576
+                suspect["thread"] = f"{m.group(1).strip()} (keeps local variables of {kept_mb:.1f} MB)"
 
         # ── Class loader (fallback if not extracted from <q>) ────────────────
         if not suspect["classloader"]:
@@ -323,43 +326,19 @@ class MATLeakSuspectsAnalyzer(MATBaseAnalyzer):
             ):
                 m = re.search(pat, content, re.IGNORECASE | re.DOTALL)
                 if m:
-                    suspect["classloader"] = self._clean_text(m.group(1))
+                    suspect["classloader"] = self._clean_text(m.group(1), raw_html=True)
                     break
 
         # ── Stack trace ──────────────────────────────────────────────────────
         if not suspect["stack"]:
             suspect["stack"] = self._extract_stack_trace(soup)
 
-        # ── Key objects from first matching data table ───────────────────────
-        if not suspect["key_objects"]:
-            for table in soup.find_all("table"):
-                headers = table.find("tr")
-                if not headers:
-                    continue
-                header_text = headers.get_text().lower()
-                if "class" in header_text and (
-                    "shallow" in header_text or "retained" in header_text
-                ):
-                    objects: List[str] = []
-                    for row in table.find_all("tr")[1:6]:
-                        cols = row.find_all(["td", "th"])
-                        if len(cols) >= 2:
-                            obj_name = self._clean_text(
-                                cols[0].get_text(separator=" ")
-                            )
-                            obj_size = cols[1].get_text(strip=True)
-                            if obj_name and len(obj_name) > 3:
-                                # obj_size may be raw bytes — convert for display
-                                mb = self._parse_size_to_mb(obj_size)
-                                display = (
-                                    f"{mb:.1f} MB"
-                                    if mb >= 0.1
-                                    else (obj_size or "?")
-                                )
-                                objects.append(f"{obj_name}: {display}")
-                    if objects:
-                        suspect["key_objects"] = objects
-                        break
+        # ── Accumulation point and the path that keeps it alive ─────────────
+        if not suspect["accumulation_point"]:
+            suspect["accumulation_point"] = self._parse_accumulation(soup)
+        acc = suspect["accumulation_point"]
+        if acc and not suspect["key_objects"]:
+            suspect["key_objects"] = [f"{acc['path_text']}: {acc['retained_mb']:.1f} MB retained"]
 
         # ── Retained size fallback ───────────────────────────────────────────
         # Try patterns that include a unit first, then raw-bytes fallbacks.
@@ -389,6 +368,63 @@ class MATLeakSuspectsAnalyzer(MATBaseAnalyzer):
                             float(val_str) * 1024 if unit.upper() == "GB" else float(val_str)
                         )
                         break
+
+    def _parse_accumulation(self, soup) -> Optional[Dict[str, Any]]:
+        """The object the memory accumulates in, and the chain of fields from its GC-root side down to it.
+
+        MAT's table "Shortest Paths To the Accumulation Point" lists the accumulation object first, then its
+        referrer, the referrer's referrer, ... Each referrer row has the field in <strong> and the object in <a>;
+        the text before the icon is the tree depth: "\\" = only child (the path continues), "+" = one of several
+        referrers (the path branches - we stop there).
+        """
+        for heading in soup.find_all(["h2", "h3", "h4", "h5"]):
+            if "Accumulation Point" not in heading.get_text():
+                continue
+            table = heading.find_next("table")
+            if not table:
+                return None
+            rows = table.find_all("tr")[1:]
+            if not rows:
+                return None
+            hops: List[Dict[str, Any]] = []
+            target, retained_mb = None, 0.0
+            for i, row in enumerate(rows):
+                tds = row.find_all("td")
+                if not tds:
+                    continue
+                first = tds[0]
+                prefix = (first.find(string=True, recursive=False) or "").strip()
+                link = first.find("a")
+                if link is None:                         # "Total: n entries"
+                    break
+                obj = re.sub(r"\s*@\s*0x[0-9a-f]+.*$", "", link.get_text(" ", strip=True))
+                obj = re.sub(r"\[\d+\]$", "[]", obj)         # java.lang.Object[109] -> java.lang.Object[]
+                if i == 0:
+                    target = obj
+                    retained_mb = self._parse_size_to_mb(tds[-1].get_text(strip=True))
+                    continue
+                if "+" in prefix:
+                    break                                # the path branches here
+                field = first.find("strong")
+                is_class = obj.startswith("class ")
+                hops.append({
+                    "holder": obj[len("class "):] if is_class else obj,
+                    "field": field.get_text(strip=True) if field else "?",
+                    "static": is_class,
+                })
+            if not target:
+                return None
+            if target.startswith("class "):              # spread over several static fields of this class
+                target = f"{target[len('class '):]} (static fields)"
+            hops.reverse()                               # root side first
+            parts = [f"{h['holder']}.{h['field']}" + (" (static)" if h["static"] else "") for h in hops]
+            return {
+                "class": target,
+                "retained_mb": retained_mb,
+                "path": hops,
+                "path_text": " → ".join(parts + [target]),
+            }
+        return None
 
     def _extract_stack_trace(self, soup) -> List[str]:
         frames: List[str] = []
@@ -483,8 +519,13 @@ class MATLeakSuspectsAnalyzer(MATBaseAnalyzer):
         problems: List[Dict] = []
         warnings: List[Dict] = []
 
+        def relevant(s: Dict[str, Any]) -> bool:
+            """Large enough to matter: at least min_problem_mb retained and min_problem_pct of the heap."""
+            pct = s.get("heap_pct", 0.0)
+            return s.get("retained_mb", 0) >= thresholds.min_problem_mb and (pct == 0 or pct >= thresholds.min_problem_pct)
+
         primary = self.report_data["primary_suspect"]
-        if primary:
+        if primary and relevant(primary):
             mb = primary.get("retained_mb", 0)
             sev = "HIGH" if mb > thresholds.primary_leak_high_mb else "MEDIUM"
             cls = primary.get("class_name") or "Unknown class"
@@ -503,6 +544,8 @@ class MATLeakSuspectsAnalyzer(MATBaseAnalyzer):
             )
 
         pct = self.report_data["summary"]["heap_leak_pct"]
+        if self.report_data["summary"]["total_leak_mb"] < thresholds.min_problem_mb:
+            pct = 0.0                                      # a few MB on a small heap: not a leak ratio worth reporting
         if pct > thresholds.heap_leak_critical_pct:
             problems.append(
                 {
@@ -530,6 +573,8 @@ class MATLeakSuspectsAnalyzer(MATBaseAnalyzer):
             + self.report_data["other_suspects"]
         )
         for s in all_secondary:
+            if not relevant(s):
+                continue
             mb = s.get("retained_mb", 0)
             cls = s.get("class_name") or f"Suspect {s['id']}"
             size_str = _size_label(s)

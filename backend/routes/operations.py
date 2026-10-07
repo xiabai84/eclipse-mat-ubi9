@@ -2,7 +2,7 @@
 
 import shutil
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from fastapi import APIRouter
 
@@ -18,7 +18,7 @@ def health() -> Dict[str, Any]:
 
     # Disk usage for key volumes
     disk = {}
-    for label, path in [("reports", settings.reports_dir), ("heapdumps", settings.heapdumps_dir)]:
+    for label, path in [("heapdumps", settings.heapdumps_dir)]:
         try:
             usage = shutil.disk_usage(path)
             disk[label] = {
@@ -35,31 +35,3 @@ def health() -> Dict[str, Any]:
         "mat_available": Path(settings.mat_script).exists(),
         "disk": disk,
     }
-
-
-@router.get("/reports")
-def list_reports(reports_dir: str = None) -> Dict[str, Any]:
-    """List MAT report ZIP files in *reports_dir*, grouped by report type."""
-    if reports_dir is None:
-        reports_dir = get_settings().reports_dir
-
-    path = Path(reports_dir)
-    if not path.exists():
-        return {"reports_dir": reports_dir, "reports": {}, "note": "Directory not found"}
-
-    zips = sorted(path.glob("*.zip"))
-    categorised: Dict[str, List[str]] = {
-        "suspects": [], "overview": [], "top_components": [], "other": [],
-    }
-    for z in zips:
-        name = z.name.lower()
-        if "leak_suspect" in name or "suspects" in name:
-            categorised["suspects"].append(str(z))
-        elif "system_overview" in name or "overview" in name:
-            categorised["overview"].append(str(z))
-        elif "top_component" in name:
-            categorised["top_components"].append(str(z))
-        else:
-            categorised["other"].append(str(z))
-
-    return {"reports_dir": reports_dir, "total": len(zips), "reports": categorised}

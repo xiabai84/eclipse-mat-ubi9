@@ -1,0 +1,93 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  MAT_VERSION: 1.16.1.20250109
+  # as published by Eclipse: downloads/sums.php?file=/mat/<ver>/rcp/<zip>&type=sha512 (same value as in the Dockerfile)
+  MAT_SHA512: bf31765edbad3185d3d6a2f2ff23c23a43838b0d46566b0c1d2152dc199e7277492d62318a5b298305870673cb503040fe2ee1000a68f949f333222bdac09149
+
+jobs:
+  unit:
+    name: unit (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.9', '3.12']        # 3.9 = UBI 9's python3
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -r backend/requirements-test.txt
+      - run: python -m pytest -q --ignore=tests/integration
+        working-directory: backend
+
+  integration:
+    name: integration (real Eclipse MAT)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.9'
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Eclipse MAT (checksum-verified)
+        run: |
+          curl -fsSL -o mat.zip "https://www.eclipse.org/downloads/download.php?file=/mat/${MAT_VERSION%.*}/rcp/MemoryAnalyzer-${MAT_VERSION}-linux.gtk.x86_64.zip&r=1"
+          echo "${MAT_SHA512}  mat.zip" | sha512sum -c -
+          unzip -q mat.zip -d "$RUNNER_TEMP"
+          echo "MAT_SCRIPT=$RUNNER_TEMP/mat/ParseHeapDump.sh" >> "$GITHUB_ENV"
+      - run: pip install -r backend/requirements-test.txt
+      - run: python -m pytest -v tests/integration
+        working-directory: backend
+
+  container:
+    name: container (build + smoke test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+      - run: docker build -f docker/Dockerfile -t eclipse-mat-service:ci .
+      - name: Ground-truth heap dump
+        run: |
+          java -Xmx1g backend/tests/integration/GroundTruth.java "$RUNNER_TEMP/gt.hprof"
+          gzip -1 "$RUNNER_TEMP/gt.hprof"
+      - name: Start the container (3 GiB limit, token)
+        run: |
+          docker run -d --name mat --memory=3g -e API_TOKEN=ci-token -p 8080:8080 eclipse-mat-service:ci
+          for i in $(seq 1 60); do curl -fs http://localhost:8080/health && break; sleep 2; done
+      - name: Smoke test
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' -F "file=@$RUNNER_TEMP/gt.hprof.gz" http://localhost:8080/analyze/heapdump)
+          [ "$code" = 401 ] || { echo "expected 401 without token, got $code"; exit 1; }
+          curl -fsS -o result.json -H "Authorization: Bearer ci-token" \
+               -F "file=@$RUNNER_TEMP/gt.hprof.gz" http://localhost:8080/analyze/heapdump
+          python3 - <<'PY'
+          import json
+          r = json.load(open("result.json"))
+          s = r["suspects"]["analysis"]
+          assert s["primary_suspect"]["class_name"] == "GroundTruth", s["primary_suspect"]
+          threads = [x["thread"] or "" for x in [s["primary_suspect"]] + s["significant_suspects"] + s["other_suspects"]]
+          assert any(t.startswith("worker-tl") for t in threads), threads
+          assert r["top_components"]["analysis"]["waste_analysis"]["empty_collections"]["count"] >= 200000
+          print("analysis OK:", r["total_problems"], "problems")
+          PY
+          docker logs mat 2>&1 | grep -F "Running MAT (-Xmx2304m)"        # 75 % of the 3 GiB limit
+          [ -z "$(docker exec mat sh -c 'ls -A /heapdumps | grep -v .mat-slots')" ]   # work directory removed
+      - if: failure()
+        run: docker logs mat

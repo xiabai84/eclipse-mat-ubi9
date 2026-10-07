@@ -1,63 +1,61 @@
-"""Unit tests for MATLeakSuspectsAnalyzer."""
+"""Leak Suspects analyzer against real MAT reports."""
 
-from pathlib import Path
+import json
 
-from analyzers.suspects import MATLeakSuspectsAnalyzer
+import pytest
 
-
-def test_analyze_returns_report_data(suspects_zip: Path):
-    analyzer = MATLeakSuspectsAnalyzer(str(suspects_zip))
-    analyzer.analyze()
-    data = analyzer.report_data
-
-    assert data["summary"]["leak_suspects_count"] >= 1
-    assert data["primary_suspect"] is not None
-    assert data["primary_suspect"]["class_name"] == "com.example.LeakyCache"
+from analyzers import MATLeakSuspectsAnalyzer
 
 
-def test_parse_suspects_count(suspects_zip: Path):
-    analyzer = MATLeakSuspectsAnalyzer(str(suspects_zip))
-    analyzer.analyze()
-
-    assert analyzer.report_data["summary"]["leak_suspects_count"] == 2
+def analyze(mat_zip, name):
+    return MATLeakSuspectsAnalyzer(str(mat_zip(name, "Leak_Suspects"))).analyze().report_data
 
 
-def test_parse_total_heap(suspects_zip: Path):
-    analyzer = MATLeakSuspectsAnalyzer(str(suspects_zip))
-    analyzer.analyze()
-
-    total_mb = analyzer.report_data["summary"]["total_heap_mb"]
-    # 107,347,272 bytes ≈ 102.3 MB
-    assert 100 < total_mb < 110
-
-
-def test_parse_retained_sizes(suspects_zip: Path):
-    analyzer = MATLeakSuspectsAnalyzer(str(suspects_zip))
-    analyzer.analyze()
-
-    primary = analyzer.report_data["primary_suspect"]
-    # 104,889,144 bytes ≈ 100.0 MB
-    assert primary["retained_mb"] > 90
+def test_static_list(mat_zip):
+    d = analyze(mat_zip, "static_list")
+    assert d["summary"]["total_heap_mb"] == pytest.approx(81.8)
+    assert d["summary"]["leak_suspects_count"] == 1
+    p = d["primary_suspect"]
+    assert p["class_name"] == "JavaMemoryIssuesDemo"
+    assert p["retained_mb"] == pytest.approx(83_892_400 / 1_048_576)
+    assert p["heap_pct"] == pytest.approx(97.78)
+    # the field that holds the memory - the key information
+    acc = p["accumulation_point"]
+    assert acc["path_text"] == "JavaMemoryIssuesDemo.STATIC_SESSIONS (static) → java.util.ArrayList.elementData → java.lang.Object[]"
+    assert acc["retained_mb"] == pytest.approx(83_889_736 / 1_048_576)
+    assert [x["type"] for x in d["problems"]] == ["PRIMARY_LEAK", "SIGNIFICANT_LEAK_RATIO"]
 
 
-def test_identify_problems(suspects_zip: Path):
-    analyzer = MATLeakSuspectsAnalyzer(str(suspects_zip))
-    analyzer.analyze()
+def test_ground_truth_cache_and_threadlocal(mat_zip):
+    d = analyze(mat_zip, "ground_truth")
+    suspects = [d["primary_suspect"]] + d["significant_suspects"] + d["other_suspects"]
+    cache = next(s for s in suspects if s["class_name"] == "GroundTruth")
+    # cache, strings and lists live in several static fields of GroundTruth: MAT names the class itself
+    assert cache["accumulation_point"]["path_text"] == "GroundTruth (static fields)"
+    tl = next(s for s in suspects if s["thread"] and s["thread"].startswith("worker-tl"))
+    assert tl["retained_mb"] == pytest.approx(60.0, abs=0.1)
+    assert tl["accumulation_point"]["path_text"].startswith("java.lang.Thread.threadLocals → java.lang.ThreadLocal$ThreadLocalMap.table")
+    # MAT: "The thread ... main keeps local variables with total size 5,672 bytes" - named, but with its size,
+    # so nobody mistakes it for the holder of the 130 MB
+    assert cache["thread"] == "main (keeps local variables of 0.0 MB)"
 
-    problem_types = [p["type"] for p in analyzer.report_data["problems"]]
-    assert "PRIMARY_LEAK" in problem_types
-    # 97.71% heap consumed → should trigger SIGNIFICANT_LEAK_RATIO
-    assert "SIGNIFICANT_LEAK_RATIO" in problem_types
+
+def test_small_heap_has_no_problems(mat_zip):
+    """MAT names suspects on every heap; 0.6 MB on a 2 MB heap is not a leak."""
+    d = analyze(mat_zip, "small_heap")
+    assert d["summary"]["leak_suspects_count"] == 2
+    assert d["problems"] == []
 
 
-def test_generate_report_text(suspects_zip: Path):
-    analyzer = MATLeakSuspectsAnalyzer(str(suspects_zip))
-    analyzer.analyze()
+def test_descriptions_keep_system_class_loader(mat_zip):
+    d = analyze(mat_zip, "small_heap")
+    assert "loaded by <system class loader>" in d["primary_suspect"]["description"]
 
-    report = analyzer.generate_report()
-    assert isinstance(report, str)
-    assert len(report) > 100
-    assert "MEMORY LEAK SUSPECTS REPORT" in report
-    assert "HEAP OVERVIEW" in report
-    assert "PRIMARY LEAK SUSPECT" in report
-    assert "com.example.LeakyCache" in report
+
+def test_no_heap_string_contents_in_result(mat_zip):
+    """MAT pages show String values next to references; the result must not carry them."""
+    from pathlib import Path
+    pages = (Path(__file__).parent / "fixtures" / "mat" / "small_heap_Leak_Suspects").rglob("*.html")
+    assert any("USER_NAME" in f.read_text() for f in pages)        # the MAT page does contain one
+    d = analyze(mat_zip, "small_heap")
+    assert "USER_NAME" not in json.dumps(d)

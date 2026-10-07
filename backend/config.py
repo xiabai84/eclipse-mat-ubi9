@@ -13,17 +13,26 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     """Core service settings."""
 
-    reports_dir: str = "/reports"
-    heapdumps_dir: str = "/heapdumps"
+    heapdumps_dir: str = "/heapdumps"          # one work directory per request below it, removed afterwards
     mat_script: str = "/opt/eclipse-mat/ParseHeapDump.sh"
-    mat_timeout_seconds: int = 600
-    max_upload_size_bytes: int = 20 * 1024 * 1024 * 1024  # 20 GB
+    mat_timeout_seconds: int = 3600
+    max_upload_size_bytes: int = 20 * 1024 * 1024 * 1024  # 20 GB (compressed size for .hprof.gz)
+    max_dump_size_bytes: int = 64 * 1024 * 1024 * 1024    # 64 GB after decompressing a .hprof.gz
+
+    # MAT runs: at most this many at the same time across all worker processes; the others wait in line
+    mat_max_concurrent: int = 1
+    mat_queue_timeout_seconds: int = 3600
+    # MAT JVM heap, e.g. "12g". Empty: 75 % of the container memory limit divided by mat_max_concurrent.
+    mat_xmx: str = ""
+
+    # Optional: when set, every endpoint except /health requires "Authorization: Bearer <api_token>"
+    api_token: str = ""
 
     log_level: str = "INFO"
     log_json: bool = False
 
     service_name: str = "mat-analysis"
-    service_version: str = "3.1.0"
+    service_version: str = "4.0.0"
 
     model_config = {"env_prefix": "", "populate_by_name": True}
 
@@ -45,6 +54,10 @@ class SuspectsThresholds(BaseSettings):
     secondary_leak_high_mb: float = 200
     heap_leak_critical_pct: float = 70
     heap_leak_warning_pct: float = 40
+    # MAT names suspects on every heap, also a healthy 2 MB one. A suspect is a problem only from this size *and*
+    # this share of the heap on (0 disables a limit).
+    min_problem_mb: float = 10
+    min_problem_pct: float = 10
 
     model_config = {"env_prefix": "SUSPECTS_"}
 

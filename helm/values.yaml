@@ -4,8 +4,8 @@ replicaCount: 1
 image:
   # -- Container image repository
   repository: eclipse-mat
-  # -- Image tag
-  tag: latest
+  # -- Image tag (empty: the chart's appVersion)
+  tag: ""
   # -- Image pull policy
   pullPolicy: IfNotPresent
 
@@ -35,13 +35,14 @@ route:
   # -- Create an OpenShift Route
   enabled: true
   # -- Annotations for the Route
-  # HAProxy timeout must accommodate large heap dump uploads + MAT analysis time
+  # The request waits for the whole analysis: keep the timeouts above upload time + config.matQueueTimeout +
+  # config.matTimeout, otherwise the router cuts the connection while MAT keeps working.
   annotations:
-    haproxy.router.openshift.io/timeout: "1800s"
+    haproxy.router.openshift.io/timeout: "7200s"
     haproxy.router.openshift.io/proxy-body-size: "20g"
     haproxy.router.openshift.io/proxy-connect-timeout: "60s"
-    haproxy.router.openshift.io/proxy-read-timeout: "1800s"
-    haproxy.router.openshift.io/proxy-send-timeout: "1800s"
+    haproxy.router.openshift.io/proxy-read-timeout: "7200s"
+    haproxy.router.openshift.io/proxy-send-timeout: "7200s"
   # -- Hostname override (leave empty for auto-generated)
   host: ""
   tls:
@@ -68,15 +69,8 @@ persistence:
     storageClassName: ""
     # -- Access mode
     accessMode: ReadWriteOnce
-  reports:
-    # -- Enable PVC for /reports
-    enabled: true
-    # -- Storage size for reports
-    size: 10Gi
-    # -- Storage class (empty = cluster default)
-    storageClassName: ""
-    # -- Access mode
-    accessMode: ReadWriteOnce
+  # -- Size limit of /tmp (emptyDir): uploads are buffered there before they are copied to /heapdumps
+  tmpSizeLimit: 25Gi
 
 # -- Pod-level security context
 # Note: Do NOT set runAsUser/fsGroup to fixed UIDs on OpenShift.
@@ -107,9 +101,23 @@ podAnnotations: {}
 # -- Additional pod labels
 podLabels: {}
 
+auth:
+  # -- Bearer token required on the analysis endpoints (empty: no authentication, a warning is logged).
+  # Prefer existingSecret over putting the token into values.
+  apiToken: ""
+  # -- Existing Secret with the token in key "api-token"
+  existingSecret: ""
+
 # -- Application configuration (mapped to env vars via ConfigMap)
 config:
-  matTimeout: "600"
+  # -- Seconds one MAT run may take
+  matTimeout: "3600"
+  # -- MAT runs at the same time (each needs memory for its heap); further requests wait
+  matMaxConcurrent: "1"
+  # -- Seconds a request waits for a free MAT slot before it gets 503
+  matQueueTimeout: "3600"
+  # -- MAT heap, e.g. "12g" (empty: 75 % of resources.limits.memory divided by matMaxConcurrent)
+  matXmx: ""
   uvicornWorkers: "4"
   logLevel: "INFO"
   logJson: "false"
@@ -122,6 +130,9 @@ config:
     secondaryLeakHighMb: "200"
     heapLeakCriticalPct: "70"
     heapLeakWarningPct: "40"
+    # -- A suspect is a problem only from this size and this share of the heap on
+    minProblemMb: "10"
+    minProblemPct: "10"
   # -- Overview analyzer thresholds (OVERVIEW_ prefix)
   overview:
     largeHeapHighMb: "2048"

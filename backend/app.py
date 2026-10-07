@@ -18,7 +18,10 @@ from pathlib import Path
 # Ensure backend/ is on sys.path so submodule imports work
 sys.path.insert(0, str(Path(__file__).parent))
 
-from fastapi import FastAPI
+import logging
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from config import get_settings
 from exceptions import register_exception_handlers
@@ -41,13 +44,26 @@ def create_app() -> FastAPI:
             "- `POST /analyze/heapdump` — structured **JSON** response (machine-readable).\n"
             "- `POST /analyze/heapdump/report` — **plain-text** report for human reading "
             "  in a terminal (`curl … | cat`). Same pipeline, different output format.\n\n"
-            "**Pre-generated report ZIPs** (`POST /analyze/suspects` etc.) — analyse "
-            "existing MAT report ZIPs that you have already generated."
+            "Set `API_TOKEN` to require `Authorization: Bearer <token>` on these endpoints."
         ),
         version=settings.service_version,
     )
 
     register_exception_handlers(application)
+
+    if not settings.api_token:
+        logging.getLogger("mat-service").warning(
+            "API_TOKEN is not set: the analysis endpoints are open to anyone who can reach the service")
+
+    @application.middleware("http")
+    async def reject_oversized_uploads(request: Request, call_next):
+        """Refuse an upload by its Content-Length before its body is read and spooled to /tmp."""
+        length = request.headers.get("content-length")
+        if request.method == "POST" and length and length.isdigit() and int(length) > settings.max_upload_size_bytes:
+            return JSONResponse(
+                status_code=413,
+                content={"detail": f"Upload exceeds {settings.max_upload_size_bytes / 1024 ** 3:.0f} GB (MAX_UPLOAD_SIZE_BYTES)"})
+        return await call_next(request)
     application.include_router(ops_router)
     application.include_router(analysis_router)
 

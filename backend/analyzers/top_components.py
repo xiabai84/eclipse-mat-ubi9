@@ -27,29 +27,25 @@ logger = logging.getLogger(__name__)
 
 _W = 80
 
-# Signatures used to locate "memory waste" analysis pages
-_WASTE_SIGNATURES: Dict[str, Dict[str, str]] = {
-    "duplicate_strings": {
-        "keywords": ["duplicate strings", "duplicated strings", "string deduplication"],
-        "label": "Duplicate Strings",
-        "type": "DUPLICATE_STRINGS",
-    },
-    "empty_collections": {
-        "keywords": ["empty collection", "zero-size collection", "empty collections"],
-        "label": "Empty Collections",
-        "type": "EMPTY_COLLECTIONS",
-    },
-    "sparse_arrays": {
-        "keywords": ["sparse array", "sparse arrays", "sparse collection"],
-        "label": "Sparse Arrays",
-        "type": "SPARSE_ARRAYS",
-    },
-    "finalizer_queue": {
-        "keywords": ["finalizer", "finalization queue", "finalizable"],
-        "label": "Finalizer Queue",
-        "type": "FINALIZER_QUEUE",
-    },
+# MAT's checks per component: <h4>title</h4><div>verdict</div>. key, type, kind:
+#   waste  - memory that could be saved (duplicate content, empty collections, ...): counted as waste
+#   ratio  - low fill ratios: the bytes MAT names are *retained* by those collections, not wasted; they often
+#            overlap with "Empty Collections" (the backing arrays) or are a big object that merely holds data
+#   info   - reference / finalizer / map statistics
+_CHECKS: Dict[str, tuple] = {
+    "Duplicate Strings": ("duplicate_strings", "DUPLICATE_STRINGS", "waste"),
+    "Empty Collections": ("empty_collections", "EMPTY_COLLECTIONS", "waste"),
+    "Zero-Length Arrays": ("zero_length_arrays", "ZERO_LENGTH_ARRAYS", "waste"),
+    "Primitive Arrays with a Constant Value": ("constant_primitive_arrays", "CONSTANT_PRIMITIVE_ARRAYS", "waste"),
+    "Collection Fill Ratios": ("collection_fill_ratios", "LOW_FILL_COLLECTIONS", "ratio"),
+    "Array Fill Ratios": ("array_fill_ratios", "LOW_FILL_ARRAYS", "ratio"),
+    "Finalizer Statistics": ("finalizer_queue", "FINALIZER_QUEUE", "info"),
+    "Map Collision Ratios": ("map_collisions", "MAP_COLLISIONS", "info"),
+    "Soft Reference Statistics": ("soft_references", "SOFT_REFERENCES", "info"),
+    "Weak Reference Statistics": ("weak_references", "WEAK_REFERENCES", "info"),
 }
+# MAT's wording when a check found nothing
+_NOTHING_FOUND = re.compile(r"^(No |Component does not|Heap dump contains no|A total of)", re.IGNORECASE)
 
 # Recommendations keyed by waste_key (module-level so class methods can access it)
 _WASTE_RECOMMENDATIONS: Dict[str, str] = {
@@ -61,10 +57,8 @@ _WASTE_RECOMMENDATIONS: Dict[str, str] = {
         "Replace empty ArrayList/HashMap with Collections.empty*() singletons "
         "or lazy-initialise"
     ),
-    "sparse_arrays": (
-        "Replace sparse arrays with HashMap or SparseArray (Android) to avoid "
-        "null-slot overhead"
-    ),
+    "zero_length_arrays": "Use shared empty array constants instead of allocating new zero-length arrays",
+    "constant_primitive_arrays": "Avoid allocating large primitive arrays that only hold a constant value",
     "finalizer_queue": (
         "Avoid finalizers — use try-with-resources and java.lang.ref.Cleaner instead"
     ),
@@ -92,29 +86,136 @@ class MATTopComponentsAnalyzer(MATBaseAnalyzer):
     # ── Parsing ───────────────────────────────────────────────────────────────
 
     def parse_report(self) -> None:
+        """Follow MAT's structure: index → one page per component (class loader) → its checks and top consumers."""
         if "index.html" in self.html_files:
             self._parse_index()
-
-        # Scan all pages for classloader sections, consumers, and waste checks
-        for filename, entry in self.html_files.items():
-            content_lower = entry["content"].lower()
-
-            if "classloader" in content_lower or "class loader" in content_lower:
-                self._parse_classloaders(filename)
-
-            if any(
-                kw in content_lower
-                for kw in ("biggest object", "top consumer", "retained heap", "dominator")
-            ):
-                self._parse_top_consumers_page(filename)
-
-            for waste_key, sig in _WASTE_SIGNATURES.items():
-                if any(kw in content_lower for kw in sig["keywords"]):
-                    if waste_key not in self.report_data["waste_analysis"]:
-                        self._parse_waste_section(filename, waste_key, sig)
-
-        self._deduplicate_consumers()
+        for comp_file in self._component_pages():
+            self._parse_component(comp_file)
+        cls = self.report_data["classloaders"]
+        self.report_data["summary"]["components_analyzed"] = len(cls)
+        # MAT's "Size" of a component is not its share of the heap (the system class loader's "Size" is often the
+        # whole heap), so sizes must not be summed. The share in % is reliable: the component with the largest
+        # share gives the total (Size / share), and every component's share follows from it.
+        if not self.report_data["summary"]["total_heap_mb"] and cls:
+            main = max(cls, key=lambda c: c["heap_pct"])
+            if main["heap_pct"] > 0:
+                total = main["size_mb"] * 100 / main["heap_pct"]
+                self.report_data["summary"]["total_heap_mb"] = total
+                self.report_data["summary"]["total_heap_raw"] = f"{total:.1f} MB"
+        total = self.report_data["summary"]["total_heap_mb"]
+        for c in cls:
+            c["retained_mb"] = c["heap_pct"] / 100 * total if total else c["size_mb"]
+        cls.sort(key=lambda c: c["retained_mb"], reverse=True)
+        for c in self.report_data["top_consumers"]:
+            c["heap_pct"] = round(c["size_mb"] / total * 100, 2) if total else 0.0
+        self.report_data["top_consumers"].sort(key=lambda c: c["size_mb"], reverse=True)
         self._analyze_problems()
+
+    def _page(self, href: str) -> Optional[Dict[str, Any]]:
+        return self.html_files.get(Path(href).name)
+
+    def _component_pages(self) -> List[str]:
+        """The component pages linked from index.html ("<name> (97%)")."""
+        index = self.html_files.get("index.html")
+        if not index:
+            return []
+        pages = []
+        for a in index["soup"].find_all("a", href=True):
+            if re.search(r"\(\d+%\)\s*$", a.get_text(" ", strip=True)) and self._page(a["href"]):
+                pages.append(Path(a["href"]).name)
+        return list(dict.fromkeys(pages))
+
+    def _parse_component(self, filename: str) -> None:
+        soup = self.html_files[filename]["soup"]
+        title = soup.find("h2")
+        if not title:
+            return
+        m = re.match(r"(.*?)\s*\((\d+)%\)\s*$", title.get_text(" ", strip=True))
+        name, pct = (m.group(1), float(m.group(2))) if m else (title.get_text(" ", strip=True), 0.0)
+        facts = title.find_next("div").get_text(" ", strip=True) if title.find_next("div") else ""
+        size = re.search(r"Size:\s*([\d.,]+\s*[KMGT]?B)", facts)
+        classes = re.search(r"Classes:\s*([\d.,]+k?)", facts)
+        objects = re.search(r"Objects:\s*([\d.,]+[kmM]?)", facts)
+        size_mb = self._parse_size_to_mb(size.group(1)) if size else 0.0
+        self.report_data["classloaders"].append({
+            "name": name,
+            "size_mb": size_mb,                          # MAT's "Size" - may overlap with other components
+            "retained_mb": 0.0,                          # share of the heap, set in parse_report()
+            "retained_raw": size.group(1) if size else "",
+            "heap_pct": pct,
+            "classes": self._parse_count(classes.group(1)) if classes else 0,
+            "objects": self._parse_count(objects.group(1)) if objects else 0,
+        })
+        for a in soup.find_all("a", href=True):
+            if a.get_text(strip=True) == "Top Consumers" and self._page(a["href"]):
+                self._parse_top_consumers(Path(a["href"]).name)
+                break
+        for h4 in soup.find_all("h4"):
+            check = h4.get_text(" ", strip=True)
+            div = h4.find_next("div")
+            if check in _CHECKS and div is not None:
+                self._record_check(name, check, div.get_text(" ", strip=True))
+
+    def _parse_count(self, raw: str) -> int:
+        """MAT abbreviates counts on component pages: "538", "250.3k", "1.2m"."""
+        m = re.fullmatch(r"([\d.,]+)\s*([kKmM]?)", raw.strip())
+        if not m:
+            return 0
+        value = self._parse_decimal(m.group(1), integral=not m.group(2))
+        return int(round(value * {"": 1, "k": 1_000, "m": 1_000_000}[m.group(2).lower()]))
+
+    def _parse_top_consumers(self, filename: str) -> None:
+        """Biggest Objects of a component: named objects with their retained heap (no tree levels, no duplicates)."""
+        soup = self.html_files[filename]["soup"]
+        for heading in soup.find_all(["h3", "h4", "h5"]):
+            if heading.get_text(strip=True) != "Biggest Objects":
+                continue
+            table = heading.find_next("table")
+            if not table:
+                return
+            header = [c.get_text(" ", strip=True).lower() for c in table.find("tr").find_all(["th", "td"])]
+            col = next((i for i, h in enumerate(header) if "retained" in h), len(header) - 1)
+            seen = {c["name"] for c in self.report_data["top_consumers"]}
+            for row in table.find_all("tr")[1:11]:
+                tds = row.find_all("td")
+                if len(tds) <= col:
+                    continue
+                link = tds[0].find("a")
+                raw = (link.get_text(" ", strip=True) if link else tds[0].get_text(" ", strip=True))
+                obj = self._clean_name(re.sub(r"\s*@\s*0x[0-9a-f]+.*$", "", raw))
+                if not obj or obj.lower().startswith("total") or obj in seen:
+                    continue
+                seen.add(obj)
+                size_raw = tds[col].get_text(strip=True)
+                self.report_data["top_consumers"].append(
+                    {"name": obj, "size_mb": self._parse_size_to_mb(size_raw), "size_raw": size_raw, "heap_pct": 0.0})
+            return
+
+    _BYTES = re.compile(r"(?:retain|Total size is)\s*(?:>=\s*)?([\d.,]+)\s*bytes", re.IGNORECASE)
+    _COUNT = re.compile(r"([\d.,]+)\s+(?:instances|occurrences)", re.IGNORECASE)
+    _TOP_ELEMENTS = re.compile(r"\s*Top elements include:.*$", re.IGNORECASE)
+
+    def _record_check(self, component: str, check: str, verdict: str) -> None:
+        """MAT's verdict of one check. Components can overlap, so per check the largest component value counts."""
+        key, ptype, kind = _CHECKS[check]
+        verdict = re.sub(r"\s*Details\s*»?\s*$", "", verdict).strip()
+        # "Top elements include: 95 × <string content>" - the heap's content, not needed for the analysis
+        verdict = self._TOP_ELEMENTS.sub("", verdict)
+        entry = self.report_data["waste_analysis"].setdefault(key, {
+            "label": check, "type": ptype, "kind": kind, "count": 0,
+            "wasted_mb": 0.0, "wasted_raw": "", "retained_mb": 0.0, "details": [],
+        })
+        if _NOTHING_FOUND.match(verdict):
+            return
+        mb = sum(self._parse_size_to_mb(b + " bytes") for b in self._BYTES.findall(verdict))
+        count = sum(int(self._parse_decimal(c, integral=True)) for c in self._COUNT.findall(verdict))
+        entry["details"].append(f"{component}: {verdict}")
+        entry["count"] = max(entry["count"], count)
+        if kind == "waste":
+            entry["wasted_mb"] = max(entry["wasted_mb"], mb)
+            entry["wasted_raw"] = f"{entry['wasted_mb']:.1f} MB"
+        elif kind == "ratio":
+            entry["retained_mb"] = max(entry["retained_mb"], mb)
 
     # ── index.html ────────────────────────────────────────────────────────────
 
@@ -163,268 +264,6 @@ class MATTopComponentsAnalyzer(MATBaseAnalyzer):
             self.report_data["summary"]["total_heap_raw"] = heap_label
             self.report_data["summary"]["total_heap_mb"] = mb
 
-    # ── Classloader section ───────────────────────────────────────────────────
-
-    def _parse_classloaders(self, filename: str) -> None:
-        """Extract classloader → retained-size data from any matching page."""
-        soup = self.html_files[filename]["soup"]
-        existing_names = {c["name"] for c in self.report_data["classloaders"]}
-
-        for table in soup.find_all("table"):
-            rows = table.find_all("tr")
-            if len(rows) < 2:
-                continue
-            header_text = rows[0].get_text().lower()
-            if not any(kw in header_text for kw in ("class loader", "classloader", "loader")):
-                continue
-            if not any(kw in header_text for kw in ("heap", "retained", "object", "size")):
-                continue
-
-            for row in rows[1:]:
-                cols = row.find_all(["td", "th"])
-                if len(cols) < 2:
-                    continue
-                name = self._short_classname(
-                    self._clean_text(cols[0].get_text(separator=" "))
-                )
-                if not name or name in existing_names or len(name) < 3:
-                    continue
-                if re.search(r"total|remainder", name, re.IGNORECASE):
-                    continue
-
-                sizes = []
-                obj_count = 0
-                heap_pct = 0.0
-                for col in cols[1:]:
-                    txt = col.get_text(strip=True)
-                    mb = self._parse_size_to_mb(txt)
-                    if mb > 0:
-                        sizes.append((mb, txt))
-                    else:
-                        n = self._parse_number(txt)
-                        if n > 0 and obj_count == 0:
-                            obj_count = n
-                    # Capture percentage column (handles European locale)
-                    if not heap_pct:
-                        pct_m = re.search(r'([\d]+[.,][\d]+|[\d]+)\s*%', txt)
-                        if pct_m:
-                            pct = float(pct_m.group(1).replace(',', '.'))
-                            if 0 < pct < 100:
-                                heap_pct = pct
-
-                if not sizes:
-                    continue
-
-                retained_mb, retained_raw = max(sizes, key=lambda x: x[0])
-                existing_names.add(name)
-                self.report_data["classloaders"].append(
-                    {
-                        "name": name[:100],
-                        "retained_mb": retained_mb,
-                        "retained_raw": retained_raw,
-                        "objects": obj_count,
-                        "heap_pct": heap_pct,
-                    }
-                )
-
-        self.report_data["classloaders"].sort(
-            key=lambda c: c["retained_mb"], reverse=True
-        )
-
-    # ── Top consumers ─────────────────────────────────────────────────────────
-
-    def _parse_top_consumers_page(self, filename: str) -> None:
-        """Harvest big-object / dominator entries from any consumers page."""
-        soup = self.html_files[filename]["soup"]
-        existing = {c["name"] for c in self.report_data["top_consumers"]}
-
-        for table in soup.find_all("table"):
-            rows = table.find_all("tr")
-            if len(rows) < 2:
-                continue
-            header_text = rows[0].get_text().lower()
-            if not any(kw in header_text for kw in ("object", "class", "heap", "label", "retained")):
-                continue
-            if "package" in header_text and "heap" not in header_text:
-                continue
-
-            for row in rows[1:11]:
-                cols = row.find_all(["td", "th"])
-                if len(cols) < 2:
-                    continue
-
-                raw_name = self._clean_text(cols[0].get_text(separator=" "))
-
-                # Skip MAT tree-navigation rows entirely — MAT prefixes package/
-                # class hierarchy nodes with "\ ", ".\ ", "..\ " etc.  These are
-                # duplicates of the fully-qualified class entries that follow.
-                if re.match(r'^\.{0,3}[/\\]', raw_name):
-                    continue
-
-                # Strip trailing "First N of M objects" expand-indicator text
-                raw_name = re.sub(
-                    r'\s+First\s+[\d,]+\s+of\s+[\d,]+\s+objects?.*',
-                    '', raw_name, flags=re.IGNORECASE,
-                ).strip()
-
-                name = self._short_classname(raw_name)
-
-                if not name or name in existing or len(name) < 2:
-                    continue
-                # Skip pure numbers, size values, and comparison-operator labels
-                # e.g. "24", "20,971,520", "<= 1.00"
-                if re.match(r'^[<>=\s\d,.\-]+$', name):
-                    continue
-                if re.search(r'^(total|remainder|first \d+)', name, re.IGNORECASE):
-                    continue
-
-                best_mb, best_raw = 0.0, ""
-                heap_pct = 0.0
-                for col in cols[1:]:
-                    txt = col.get_text(strip=True)
-                    mb = self._parse_size_to_mb(txt)
-                    if mb > best_mb:
-                        best_mb, best_raw = mb, txt
-                    # Read heap-percentage column so we can derive total heap later.
-                    # Handle both US ("29.37 %") and European ("29,37 %") decimal formats.
-                    if not heap_pct:
-                        pct_m = re.search(r'([\d]+[.,][\d]+|[\d]+)\s*%', txt)
-                        if pct_m:
-                            pct = float(pct_m.group(1).replace(',', '.'))
-                            if 0 < pct < 100:
-                                heap_pct = pct
-
-                if best_mb <= 0:
-                    continue
-
-                existing.add(name)
-                self.report_data["top_consumers"].append(
-                    {
-                        "name": name[:100],
-                        "size_mb": best_mb,
-                        "size_raw": best_raw,
-                        "heap_pct": heap_pct,
-                    }
-                )
-
-    # ── Waste analysis ────────────────────────────────────────────────────────
-
-    def _parse_waste_section(
-        self, filename: str, waste_key: str, sig: Dict[str, str]
-    ) -> None:
-        """Extract headline numbers from a memory-waste analysis section."""
-        soup = self.html_files[filename]["soup"]
-        content = self.html_files[filename]["content"]
-
-        waste_record: Dict[str, Any] = {
-            "label": sig["label"],
-            "type": sig["type"],
-            "count": 0,
-            "wasted_mb": 0.0,
-            "wasted_raw": "",
-            "details": [],
-        }
-
-        for table in soup.find_all("table"):
-            rows = table.find_all("tr")
-            if len(rows) < 2:
-                continue
-            header = rows[0].get_text().lower()
-            has_keyword = any(kw in header for kw in sig["keywords"])
-            has_size = any(kw in header for kw in ("heap", "wasted", "size", "bytes"))
-            if not (has_keyword or has_size):
-                continue
-
-            for row in rows[1:6]:
-                cols = row.find_all(["td", "th"])
-                if len(cols) < 2:
-                    continue
-                name = self._clean_text(cols[0].get_text())
-                if not name:
-                    continue
-                for col in cols[1:]:
-                    txt = col.get_text(strip=True)
-                    mb = self._parse_size_to_mb(txt)
-                    if mb > 0:
-                        waste_record["wasted_mb"] += mb
-                        if not waste_record["wasted_raw"]:
-                            waste_record["wasted_raw"] = txt
-                    n = self._parse_number(txt)
-                    if n > 0 and waste_record["count"] == 0:
-                        waste_record["count"] = n
-                detail_str = f"{name}: {cols[1].get_text(strip=True)}"
-                waste_record["details"].append(detail_str[:100])
-
-            if waste_record["wasted_mb"] > 0 or waste_record["details"]:
-                break
-
-        # Fallback: regex on raw content
-        if waste_record["wasted_mb"] == 0:
-            for pat in (
-                r"wasted\s+([\d,.]+)\s*(MB|GB)",
-                r"([\d,.]+)\s*(MB|GB)\s+wasted",
-                r"total\s+([\d,.]+)\s*(MB|GB)",
-            ):
-                m = re.search(pat, content, re.IGNORECASE)
-                if m:
-                    val = m.group(1).replace(",", "")
-                    unit = m.group(2)
-                    waste_record["wasted_mb"] = (
-                        float(val) * 1024 if unit.upper() == "GB" else float(val)
-                    )
-                    waste_record["wasted_raw"] = f"{val} {unit}"
-                    break
-
-        self.report_data["waste_analysis"][waste_key] = waste_record
-
-    # ── Post-processing ───────────────────────────────────────────────────────
-
-    def _deduplicate_consumers(self) -> None:
-        """Sort top_consumers by size, remove duplicates, derive total heap."""
-        seen: set = set()
-        unique = []
-        for c in sorted(
-            self.report_data["top_consumers"],
-            key=lambda x: x["size_mb"],
-            reverse=True,
-        ):
-            if c["name"] not in seen:
-                seen.add(c["name"])
-                unique.append(c)
-        self.report_data["top_consumers"] = unique[:20]
-        self.report_data["summary"]["components_analyzed"] = len(unique)
-
-        # Derive total heap from the largest consumer whose heap_pct was read
-        # from the table — this covers reports where the pie-chart img is absent.
-        if self.report_data["summary"]["total_heap_mb"] == 0.0:
-            for c in unique:
-                pct = c.get("heap_pct", 0.0)
-                mb = c.get("size_mb", 0.0)
-                if pct > 0 and mb > 0:
-                    derived = mb / (pct / 100.0)
-                    self.report_data["summary"]["total_heap_mb"] = derived
-                    self.report_data["summary"]["total_heap_raw"] = f"{derived:.1f} MB"
-                    logger.debug(
-                        "Total heap derived from consumer pct: %.1f MB (pct=%.2f%%)",
-                        derived, pct,
-                    )
-                    break
-
-        # Fallback: derive from classloaders table if consumers had no pct data.
-        if self.report_data["summary"]["total_heap_mb"] == 0.0:
-            for cl in self.report_data["classloaders"]:
-                pct = cl.get("heap_pct", 0.0)
-                mb = cl.get("retained_mb", 0.0)
-                if pct > 0 and mb > 0:
-                    derived = mb / (pct / 100.0)
-                    self.report_data["summary"]["total_heap_mb"] = derived
-                    self.report_data["summary"]["total_heap_raw"] = f"{derived:.1f} MB"
-                    logger.debug(
-                        "Total heap derived from classloader pct: %.1f MB (pct=%.2f%%)",
-                        derived, pct,
-                    )
-                    break
-
     # ── Problem detection ─────────────────────────────────────────────────────
 
     def _analyze_problems(self) -> None:
@@ -433,78 +272,50 @@ class MATTopComponentsAnalyzer(MATBaseAnalyzer):
 
         problems: List[Dict] = []
         warnings: List[Dict] = []
-
         total_mb = self.report_data["summary"]["total_heap_mb"]
 
-        # Classloader dominance
+        # Application classes live in the application class loader, so one loader holding most of the heap is
+        # normal - worth a look only when it is large.
         for cl in self.report_data["classloaders"][:3]:
-            mb = cl["retained_mb"]
-            if mb > thresholds.dominant_classloader_mb:
-                pct = (mb / total_mb * 100) if total_mb > 0 else 0
-                problems.append(
-                    {
-                        "severity": "HIGH" if pct > thresholds.dominant_classloader_high_pct else "MEDIUM",
-                        "type": "DOMINANT_CLASSLOADER",
-                        "description": (
-                            f"ClassLoader '{cl['name'][:60]}' retains "
-                            f"{mb:.1f} MB ({pct:.1f}% of heap)"
-                        ),
-                        "recommendation": (
-                            "Investigate classes loaded by this classloader; "
-                            "check for classloader leak"
-                        ),
-                    }
-                )
+            if cl["retained_mb"] > thresholds.dominant_classloader_mb:
+                warnings.append({
+                    "type": "DOMINANT_CLASSLOADER",
+                    "description": f"Class loader '{cl['name'][:60]}' retains {cl['retained_mb']:.1f} MB ({cl['heap_pct']:.0f}% of heap)",
+                })
 
-        # Large individual consumers
+        # Single objects that retain a large part of the heap
         for consumer in self.report_data["top_consumers"][:5]:
-            mb = consumer["size_mb"]
-            pct = (mb / total_mb * 100) if total_mb > 0 else 0
-            if mb > thresholds.dominant_consumer_mb or pct > thresholds.dominant_consumer_pct:
-                problems.append(
-                    {
-                        "severity": "HIGH",
-                        "type": "DOMINANT_CONSUMER",
-                        "description": (
-                            f"'{consumer['name'][:60]}' consumes "
-                            f"{mb:.1f} MB ({pct:.1f}% of heap)"
-                        ),
-                        "recommendation": "Examine its retention path in MAT Dominator Tree",
-                    }
-                )
+            mb, pct = consumer["size_mb"], consumer["heap_pct"]
+            if mb > thresholds.dominant_consumer_mb or (pct > thresholds.dominant_consumer_pct and mb > thresholds.large_consumer_mb):
+                problems.append({
+                    "severity": "HIGH",
+                    "type": "DOMINANT_CONSUMER",
+                    "description": f"'{consumer['name'][:60]}' retains {mb:.1f} MB ({pct:.1f}% of heap)",
+                    "recommendation": "Examine its retention path in MAT Dominator Tree",
+                })
             elif mb > thresholds.large_consumer_mb:
-                warnings.append(
-                    {
-                        "type": "LARGE_CONSUMER",
-                        "description": f"'{consumer['name'][:60]}' consumes {mb:.1f} MB",
-                    }
-                )
+                warnings.append({"type": "LARGE_CONSUMER", "description": f"'{consumer['name'][:60]}' retains {mb:.1f} MB"})
 
-        # Waste analysis issues
-        for waste_key, waste in self.report_data["waste_analysis"].items():
-            wasted = waste["wasted_mb"]
-            if wasted > thresholds.waste_problem_mb:
-                problems.append(
-                    {
-                        "severity": "MEDIUM",
-                        "type": waste["type"],
-                        "description": (
-                            f"{waste['label']}: {wasted:.1f} MB wasted"
-                            + (f" ({waste['count']:,} instances)" if waste["count"] else "")
-                        ),
-                        "recommendation": _WASTE_RECOMMENDATIONS.get(
-                            waste_key,
-                            "Review and reduce unnecessary object allocations",
-                        ),
-                    }
-                )
-            elif wasted > thresholds.waste_warning_mb:
-                warnings.append(
-                    {
-                        "type": waste["type"],
-                        "description": f"{waste['label']}: {wasted:.1f} MB wasted",
-                    }
-                )
+        for key, w in self.report_data["waste_analysis"].items():
+            if not w["details"]:
+                continue
+            verdict = w["details"][0]
+            if w["kind"] == "waste" and w["wasted_mb"] > thresholds.waste_problem_mb:
+                problems.append({
+                    "severity": "MEDIUM",
+                    "type": w["type"],
+                    "description": f"{w['label']}: {w['wasted_mb']:.1f} MB ({verdict[:160]})",
+                    "recommendation": _WASTE_RECOMMENDATIONS.get(key, "Review and reduce unnecessary object allocations"),
+                })
+            elif w["kind"] == "waste" and w["wasted_mb"] > thresholds.waste_warning_mb:
+                warnings.append({"type": w["type"], "description": f"{w['label']}: {w['wasted_mb']:.1f} MB ({verdict[:160]})"})
+            elif w["kind"] == "ratio" and w["retained_mb"] > thresholds.waste_warning_mb:
+                warnings.append({
+                    "type": w["type"],
+                    "description": f"{w['label']}: collections with a low fill ratio retain {w['retained_mb']:.1f} MB ({verdict[:160]})",
+                })
+            elif w["kind"] == "info" and w["type"] in ("FINALIZER_QUEUE", "MAP_COLLISIONS"):
+                warnings.append({"type": w["type"], "description": f"{w['label']}: {verdict[:200]}"})
 
         self.report_data["problems"] = problems
         self.report_data["warnings"] = warnings

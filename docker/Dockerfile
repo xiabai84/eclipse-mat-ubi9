@@ -25,7 +25,13 @@
 # =============================================================================
 # Stage 1 — rpm-builder
 # =============================================================================
-FROM registry.access.redhat.com/ubi9/ubi-minimal:latest AS rpm-builder
+# UBI minor version: pinned for reproducible builds; Red Hat still ships security fixes within it. For fully
+# fixed builds use a dated tag (e.g. 9.8-1791279563) or a digest, and update it deliberately.
+ARG UBI_TAG=9.8
+ARG MAT_VERSION=1.16.1.20250109
+ARG MAT_SHA512=bf31765edbad3185d3d6a2f2ff23c23a43838b0d46566b0c1d2152dc199e7277492d62318a5b298305870673cb503040fe2ee1000a68f949f333222bdac09149
+
+FROM registry.access.redhat.com/ubi9/ubi-minimal:${UBI_TAG} AS rpm-builder
 
 # Install build-time tools only — they stay in this stage and are never copied
 # into the final image.
@@ -90,10 +96,14 @@ RUN versioned=$(ls -d /build/root/usr/lib/jvm/java-17-openjdk-17* 2>/dev/null | 
            exit 1; \
        fi
 
-# ── Download and extract Eclipse MAT ─────────────────────────────────────────
+# ── Download, verify and extract Eclipse MAT ─────────────────────────────────
+# SHA-512 as published by Eclipse (downloads/sums.php?file=/mat/<ver>/rcp/<zip>&type=sha512)
+ARG MAT_VERSION
+ARG MAT_SHA512
 RUN wget --progress=bar:force \
         -O /tmp/mat.zip \
-        "https://www.eclipse.org/downloads/download.php?file=/mat/1.16.1/rcp/MemoryAnalyzer-1.16.1.20250109-linux.gtk.x86_64.zip&r=1" \
+        "https://www.eclipse.org/downloads/download.php?file=/mat/${MAT_VERSION%.*}/rcp/MemoryAnalyzer-${MAT_VERSION}-linux.gtk.x86_64.zip&r=1" \
+    && echo "${MAT_SHA512}  /tmp/mat.zip" | sha512sum -c - \
     && unzip /tmp/mat.zip -d /opt/ \
     && rm /tmp/mat.zip \
     && mv /opt/mat /opt/eclipse-mat \
@@ -102,7 +112,7 @@ RUN wget --progress=bar:force \
 # =============================================================================
 # Stage 2 — pip-builder
 # =============================================================================
-FROM registry.access.redhat.com/ubi9/ubi-minimal:latest AS pip-builder
+FROM registry.access.redhat.com/ubi9/ubi-minimal:${UBI_TAG} AS pip-builder
 
 # Install Python + build tools needed to compile C extensions (lxml).
 # These packages stay in this stage — only /opt/venv is carried forward.
@@ -128,7 +138,7 @@ RUN pip install --no-cache-dir --upgrade pip \
 # =============================================================================
 # Stage 3 — runtime
 # =============================================================================
-FROM registry.access.redhat.com/ubi9/ubi-minimal:latest AS runtime
+FROM registry.access.redhat.com/ubi9/ubi-minimal:${UBI_TAG} AS runtime
 
 LABEL maintainer="eclipse-mat-service" \
       description="Eclipse MAT heap analysis + FastAPI REST service"
@@ -186,7 +196,7 @@ RUN chmod 755 /usr/local/bin/entrypoint.sh \
 # ── Environment ─────────────────────────────────────────────────────────────
 ENV JAVA_HOME=/usr/lib/jvm/jre-17-openjdk \
     PATH="/opt/venv/bin:/usr/lib/jvm/jre-17-openjdk/bin:/usr/local/bin:${PATH}" \
-    MAT_TIMEOUT=600 \
+    MAT_TIMEOUT=3600 \
     UVICORN_WORKERS=4 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
@@ -200,15 +210,15 @@ ENV JAVA_HOME=/usr/lib/jvm/jre-17-openjdk \
 RUN echo "mat:x:1001:1001::/home/mat:/sbin/nologin" >> /etc/passwd \
     && echo "mat:x:1001:" >> /etc/group
 
-RUN mkdir -p /home/mat /heapdumps /reports \
-    && chown mat:mat /home/mat /heapdumps /reports
+RUN mkdir -p /home/mat /heapdumps \
+    && chown mat:mat /home/mat /heapdumps
 
 USER mat
 WORKDIR /home/mat
 
 EXPOSE 8080
 
-VOLUME ["/heapdumps", "/reports"]
+VOLUME ["/heapdumps"]
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["service"]
