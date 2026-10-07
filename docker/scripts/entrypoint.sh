@@ -21,7 +21,7 @@ Eclipse MAT Heap Analysis REST Service
 
 Usage:
   docker run -v \$(pwd)/heapdumps:/heapdumps \\
-             -v \$(pwd)/reports:/reports \\
+             --memory=16g -e API_TOKEN=<token> \\
              -p 8080:8080 \\
              eclipse-mat [service]
 
@@ -29,16 +29,13 @@ Commands:
   service   Start the REST analysis service (default)
   --help    Show this help message
 
-REST API:
-  GET  http://localhost:8080/health              Liveness probe
-  GET  http://localhost:8080/reports             List ZIP reports
-  POST http://localhost:8080/analyze/heapdump    Upload .hprof -> JSON analysis
-  POST http://localhost:8080/analyze/heapdump/report  Upload .hprof -> text report
-  POST http://localhost:8080/analyze/suspects    Analyse Leak Suspects ZIP
-  POST http://localhost:8080/analyze/overview    Analyse System Overview ZIP
-  POST http://localhost:8080/analyze/top-components  Analyse Top Components ZIP
-  POST http://localhost:8080/analyze/all         Auto-discover & run all analysers
-  GET  http://localhost:8080/docs                OpenAPI / Swagger UI
+REST API (with API_TOKEN set: header "Authorization: Bearer <token>"):
+  GET  http://localhost:8080/health                   Liveness probe
+  POST http://localhost:8080/analyze/heapdump         Upload .hprof / .hprof.gz -> JSON analysis
+  POST http://localhost:8080/analyze/heapdump/report  Upload .hprof / .hprof.gz -> text report
+  GET  http://localhost:8080/docs                     OpenAPI / Swagger UI
+
+MAT heap: 75 % of the container memory limit, or MAT_XMX. See README "Configuration".
 EOF
         exit 0
         ;;

@@ -186,7 +186,8 @@ Java RPMs downloaded via `yumdownloader` and extracted with `rpm2cpio`:
 | `nss-softokn` | NSS crypto module (`libsoftokn3.so`) |
 | `nss-softokn-freebl` | FIPS-capable freebl crypto (`libfreebl3.so`, `libfreeblpriv3.so`) |
 
-Eclipse MAT 1.16.1 is downloaded from eclipse.org and extracted to `/opt/eclipse-mat`.
+Eclipse MAT 1.16.1 is downloaded from eclipse.org, checked against the SHA-512 Eclipse publishes (build arg
+`MAT_SHA512`) and extracted to `/opt/eclipse-mat`.
 
 #### Stage 2 — `pip-builder` (build-time only)
 
@@ -224,7 +225,7 @@ System packages installed via `microdnf`:
 |---------|---------|
 | `python3` | CPython 3.9 interpreter |
 | `bash` | Shell for entrypoint script |
-| `unzip` | Extracting ZIP report contents at runtime |
+| `unzip` | Inspecting MAT reports inside the container (the service itself extracts them with Python's `zipfile`) |
 | `fontconfig` | Font configuration library required by Java AWT/BIRT chart rendering |
 | `dejavu-sans-fonts` | Basic font set for MAT pie charts and report graphics |
 
@@ -414,7 +415,8 @@ jcmd <PID> GC.heap_dump ./heapdumps/myapp.hprof
 
 ## Batch Analysis
 
-Analyse all heap dumps in a single pass:
+Analyse all heap dumps in a single pass. The reports are written on the client (`./reports/`); leave out the
+`Authorization` header when the service runs without `API_TOKEN`.
 
 ### Plain-text reports
 
@@ -423,11 +425,13 @@ HEAPDUMP_DIR="./heapdumps"
 REPORT_DIR="./reports/text"
 mkdir -p "$REPORT_DIR"
 
-for hprof in "$HEAPDUMP_DIR"/*.hprof; do
-    name="$(basename "$hprof" .hprof)"
+for dump in "$HEAPDUMP_DIR"/*.hprof "$HEAPDUMP_DIR"/*.hprof.gz; do
+    [ -f "$dump" ] || continue
+    name="$(basename "$dump" | sed 's/\.hprof\(\.gz\)\{0,1\}$//')"
     echo "Analysing $name ..."
     curl -s -X POST http://localhost:8080/analyze/heapdump/report \
-         -F "file=@$hprof" > "$REPORT_DIR/${name}.txt"
+         -H "Authorization: Bearer $API_TOKEN" \
+         -F "file=@$dump" > "$REPORT_DIR/${name}.txt"
 done
 ```
 
@@ -435,20 +439,26 @@ done
 
 ```bash
 mkdir -p ./reports/json
-for hprof in ./heapdumps/*.hprof; do
-    name="$(basename "$hprof" .hprof)"
+for dump in ./heapdumps/*.hprof ./heapdumps/*.hprof.gz; do
+    [ -f "$dump" ] || continue
+    name="$(basename "$dump" | sed 's/\.hprof\(\.gz\)\{0,1\}$//')"
     curl -s -X POST http://localhost:8080/analyze/heapdump \
-         -F "file=@$hprof" | python3 -m json.tool > "./reports/json/${name}.json"
+         -H "Authorization: Bearer $API_TOKEN" \
+         -F "file=@$dump" | python3 -m json.tool > "./reports/json/${name}.json"
 done
 ```
 
 ### Parallel execution (GNU parallel)
 
+The service runs at most `MAT_MAX_CONCURRENT` MAT analyses at a time; further uploads wait in line (up to
+`MAT_QUEUE_TIMEOUT_SECONDS`, then `503`). More parallel uploads than MAT slots only save upload time.
+
 ```bash
 mkdir -p ./reports/text
-ls ./heapdumps/*.hprof | parallel -j4 \
+ls ./heapdumps/*.hprof | parallel -j2 \
   'name=$(basename {} .hprof); \
    curl -s -X POST http://localhost:8080/analyze/heapdump/report \
+        -H "Authorization: Bearer $API_TOKEN" \
         -F "file=@{}" > ./reports/text/${name}.txt && echo "done: $name"'
 ```
 
@@ -602,9 +612,12 @@ checksum-verified MAT, and builds the image and smoke-tests it with a memory lim
 ```
 eclipse-mat-service/
 ├── README.md
+├── CLAUDE.md                           # Notes for Claude Code (workflow, architecture, gotchas)
+├── .github/workflows/ci.yml            # CI: unit tests, integration test with real MAT, image smoke test
+├── tasks/todo.md                       # Plan and review of the 4.0.0 changes
 │
 ├── backend/                            # Python REST service
-│   ├── app.py                          # App factory (~57 lines) — creates FastAPI instance
+│   ├── app.py                          # App factory: FastAPI instance, upload-size check, auth warning
 │   ├── config.py                       # Pydantic BaseSettings: all config + analyzer thresholds
 │   ├── logging_config.py               # Structured JSON logging (LOG_JSON=true)
 │   ├── auth.py                         # Optional bearer token (API_TOKEN)
@@ -614,7 +627,7 @@ eclipse-mat-service/
 │   ├── requirements-test.txt           # Test dependencies (pytest, httpx)
 │   ├── routes/
 │   │   ├── operations.py               # /health (with disk info)
-│   │   └── analysis.py                 # All /analyze/* routes
+│   │   └── analysis.py                 # POST /analyze/heapdump, /analyze/heapdump/report
 │   ├── services/
 │   │   ├── mat_runner.py               # MAT run: slots, -vmargs, process-group timeout
 │   │   └── analysis_service.py         # Work dir per request → MAT → analyzers → cleanup
@@ -648,20 +661,20 @@ eclipse-mat-service/
 │   └── run-demo.sh                     # Compile & run helper
 │
 ├── helm/                               # Helm chart for OpenShift deployment
-│   └── eclipse-mat-service/
-│       ├── Chart.yaml                  # Chart metadata (v0.1.0, appVersion 3.1.0)
-│       ├── values.yaml                 # All configurable defaults
-│       └── templates/                  # K8s/OpenShift resource templates
-│           ├── _helpers.tpl            # Template helper functions
-│           ├── deployment.yaml         # Deployment with probes, PVCs, ConfigMap
-│           ├── service.yaml            # ClusterIP Service (port 8080)
-│           ├── route.yaml              # OpenShift Route (TLS edge)
-│           ├── configmap.yaml          # All env vars from config.py
-│           ├── pvc-heapdumps.yaml      # PVC for /heapdumps (50Gi)
-│           ├── secret.yaml             # API token (only with auth.apiToken)
-│           └── serviceaccount.yaml     # ServiceAccount with pull secrets
+│   ├── Chart.yaml                      # Chart metadata (v0.2.0, appVersion 4.0.0)
+│   ├── values.yaml                     # All configurable defaults
+│   └── templates/                      # K8s/OpenShift resource templates
+│       ├── _helpers.tpl                # Template helper functions
+│       ├── deployment.yaml             # Deployment with probes, PVC, ConfigMap, optional token
+│       ├── service.yaml                # ClusterIP Service (port 8080)
+│       ├── route.yaml                  # OpenShift Route (TLS edge)
+│       ├── configmap.yaml              # All env vars from config.py
+│       ├── pvc-heapdumps.yaml          # PVC for /heapdumps (50Gi)
+│       ├── secret.yaml                 # API token (only with auth.apiToken)
+│       └── serviceaccount.yaml         # ServiceAccount with pull secrets
 │
-├── heapdumps/                          # Volume mount: .hprof files
+├── docs/plans/                         # Design documents (dated; describe the state of their time)
+├── heapdumps/                          # Local heap dumps (demo output, docker run volume)
 ```
 
 ---
@@ -670,20 +683,31 @@ eclipse-mat-service/
 
 **`mat_available: false` in `/health`**
 
-MAT was not found at `/opt/eclipse-mat/ParseHeapDump.sh`. The Docker build
-probably failed to download MAT (network issue). Rebuild the image. The
-`/analyze/suspects`, `/analyze/overview`, and `/analyze/top-components` endpoints
-still work with pre-generated ZIPs and do not require MAT.
+MAT was not found at `/opt/eclipse-mat/ParseHeapDump.sh` (or `MAT_SCRIPT`). The Docker build probably failed to
+download MAT (network issue, or the SHA-512 check failed). Rebuild the image. Without MAT no analysis is possible.
 
-**MAT times out on large heap dumps**
+**`502` – `MAT failed (exit …) - MAT ran out of memory`**
 
-Set `MAT_TIMEOUT` to a higher value (e.g. `3600` for 1 hour). Ensure the
-container has enough RAM -- MAT requires approximately 2x the heap dump size.
+MAT's heap is too small for the dump (it needs roughly 1.5–2× the dump size). Raise the container memory limit
+(MAT gets 75 % of it) or set `MAT_XMX` explicitly. The detail contains the last lines of MAT's output.
 
-**`Only .hprof heap dump files are accepted`**
+**`504` – MAT timed out**
 
-The upload endpoint validates the file extension. Rename the file to end with
-`.hprof` if it was saved with a different extension.
+Raise `MAT_TIMEOUT` (default `3600`), and the timeouts of everything in front of the service (router, ingress),
+which must exceed upload time + `MAT_QUEUE_TIMEOUT_SECONDS` + `MAT_TIMEOUT`. The MAT process is killed on timeout.
+
+**`503` – MAT is busy**
+
+All `MAT_MAX_CONCURRENT` slots were taken for `MAT_QUEUE_TIMEOUT_SECONDS`. Retry later (`Retry-After` header), raise
+the queue timeout, or – with enough memory – `MAT_MAX_CONCURRENT`.
+
+**`401` – Missing or invalid bearer token**
+
+The service runs with `API_TOKEN`; send `-H "Authorization: Bearer <token>"`.
+
+**`Only .hprof and .hprof.gz heap dumps are accepted.`**
+
+The upload endpoint validates the file extension. Rename the file if it was saved with a different extension.
 
 **Permission denied errors in container**
 
@@ -747,7 +771,7 @@ If you still see this error, verify the `emptyDir` volumes are present:
 
 ```bash
 oc get deployment <release-name> -o jsonpath='{.spec.template.spec.volumes[*].name}'
-# Expected: tmp home-mat mat-workspace heapdumps reports
+# Expected: tmp home-mat mat-workspace heapdumps
 ```
 
 **`there was an error parsing the body` (HTTP 400) on file upload**
@@ -760,16 +784,16 @@ annotation is present:
 oc get route <release-name> -o jsonpath='{.metadata.annotations}'
 ```
 
-If uploading very large dumps (> 1 GB), also ensure the timeout annotations are
-sufficient:
+The request stays open for upload, queue and analysis. The chart's default timeouts are 2 hours; keep them above
+upload time + `config.matQueueTimeout` + `config.matTimeout`:
 
 ```yaml
 route:
   annotations:
-    haproxy.router.openshift.io/timeout: "1800s"
+    haproxy.router.openshift.io/timeout: "7200s"
     haproxy.router.openshift.io/proxy-body-size: "20g"
-    haproxy.router.openshift.io/proxy-read-timeout: "1800s"
-    haproxy.router.openshift.io/proxy-send-timeout: "1800s"
+    haproxy.router.openshift.io/proxy-read-timeout: "7200s"
+    haproxy.router.openshift.io/proxy-send-timeout: "7200s"
 ```
 
 **Upload returns empty response (HTTP status 0) or curl exit code 7**
@@ -782,31 +806,22 @@ Two common causes:
 
    ```bash
    curl -k -X POST https://<route>/analyze/heapdump/report \
-     -F "file=@./dump.hprof"
+     -H "Authorization: Bearer $API_TOKEN" \
+     -F "file=@./dump.hprof.gz"
    ```
 
 2. **HAProxy timeout during upload.** Large heap dumps can take minutes to upload.
    Increase the Route timeout annotations (see above).
 
-**`No matching ZIP found` — MAT runs but produces no reports**
+**`502` – `MAT failed (exit …, missing reports: …)` – MAT runs but produces no reports**
 
-MAT needs write access to its workspace directory inside `/opt/eclipse-mat/`. The
-Helm chart mounts an `emptyDir` at `/opt/eclipse-mat/workspace` for this purpose.
-
-If reports are still missing, check the MAT stderr output:
+MAT needs write access to its workspace directory inside `/opt/eclipse-mat/` and to `/heapdumps` (it writes its
+index files and reports next to the dump). The Helm chart mounts an `emptyDir` at `/opt/eclipse-mat/workspace`.
+The response detail ends with the last lines of MAT's output; the service log has the rest:
 
 ```bash
 oc logs deployment/<release-name> | grep -i "error\|permission\|denied\|workspace"
 ```
-
-Use the JSON endpoint to see the full MAT result including return code and stderr:
-
-```bash
-curl -k -X POST https://<route>/analyze/heapdump \
-  -F "file=@./dump.hprof" | python3 -m json.tool
-```
-
-Look at the `mat.returncode`, `mat.stderr_tail`, and `mat.reports_generated` fields.
 
 **Pod stuck in `CrashLoopBackOff`**
 

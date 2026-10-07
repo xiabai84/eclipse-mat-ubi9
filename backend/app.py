@@ -1,14 +1,14 @@
 """
-MAT Analysis REST Service  v3.1
-================================
-A FastAPI service that exposes Eclipse Memory Analyzer Tool (MAT) report
-analysis over HTTP — including direct Java heap dump upload and analysis.
+MAT Analysis REST Service  v4
+==============================
+A FastAPI service that runs Eclipse Memory Analyzer Tool (MAT) on an uploaded
+Java heap dump (.hprof / .hprof.gz) and returns the analysis as JSON or text.
 
 Usage inside Docker (service mode)
 -----------------------------------
-  docker run -p 8080:8080 \\
+  docker run -p 8080:8080 --memory=16g \\
+    -e API_TOKEN=<token> \\
     -v $(pwd)/heapdumps:/heapdumps \\
-    -v $(pwd)/reports:/reports   \\
     eclipse-mat service
 """
 

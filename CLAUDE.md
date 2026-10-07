@@ -120,7 +120,7 @@ python tests/fixtures/make_fixtures.py <dir> <name> <fixture>     # new fixtures
 
 ```
 backend/
-├── app.py                          # App factory (~57 lines) — creates FastAPI instance
+├── app.py                          # App factory: FastAPI instance, upload-size check, auth warning
 ├── config.py                       # Pydantic BaseSettings: all config + analyzer thresholds
 ├── logging_config.py               # Structured JSON logging (LOG_JSON=true for ELK/CloudWatch)
 ├── auth.py                         # Optional bearer token (API_TOKEN)
@@ -140,6 +140,13 @@ backend/
     ├── overview.py                 # MATSystemOverviewAnalyzer: heap summary, top entries by type
     ├── top_components.py           # MATTopComponentsAnalyzer: largest retained-heap components
     └── java_recommendations.json   # 16 diagnostic patterns (externalized from base.py)
+└── tests/
+    ├── conftest.py                 # real MAT fixtures (zipped at test time), FAKE_MAT stand-in, service fixture
+    ├── fixtures/                   # make_fixtures.py + mat/<fixture>_<report>/ (real MAT HTML, scrubbed)
+    ├── integration/                # GroundTruth.java + test_real_mat.py (needs MAT_SCRIPT)
+    └── test_*.py                   # parsing, analyzers, text reports, service
+
+.github/workflows/ci.yml            # unit (Py 3.9/3.12), integration (real MAT, SHA-512), container smoke test
 
 docker/
 ├── Dockerfile                # 3-stage build: rpm-builder → pip-builder → runtime

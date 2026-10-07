@@ -145,8 +145,8 @@ LABEL maintainer="eclipse-mat-service" \
 
 # ── Runtime packages only ────────────────────────────────────────────────────
 # python3        → CPython interpreter (FastAPI service)
-# bash           → entrypoint.sh and analysis shell scripts
-# unzip          → report_script.sh extracts ZIP contents at runtime
+# bash           → entrypoint.sh
+# unzip          → inspecting MAT reports in the container (the service extracts them with Python's zipfile)
 # fontconfig     → required by Java AWT/BIRT chart rendering in MAT reports
 # dejavu-sans-fonts → basic font set for MAT pie charts and report graphics
 RUN microdnf install -y --nodocs \
